@@ -1,0 +1,19 @@
+[Unit]
+Description=Meituan Waimai reply bot admin
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Environment=TZ=Asia/Shanghai
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/meituan-reply-bot
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/ubuntu/meituan-reply-bot/admin.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

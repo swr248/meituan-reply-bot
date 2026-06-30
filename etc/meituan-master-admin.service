@@ -1,0 +1,18 @@
+[Unit]
+Description=Meituan Master Admin Dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Environment=TZ=Asia/Shanghai
+Environment=PYTHONUNBUFFERED=1
+Environment=MASTER_ADMIN_TOKEN=
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/meituan-master-admin
+ExecStart=/home/ubuntu/meituan-reply-bot/.venv/bin/python master_admin.py --host 0.0.0.0 --port 5904
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

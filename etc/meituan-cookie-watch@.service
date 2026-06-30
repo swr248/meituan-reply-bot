@@ -1,0 +1,8 @@
+[Unit]
+Description=Meituan cookie auto-refresh watcher (%i)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/meituan-cookie-watch.sh %i
+Nice=10

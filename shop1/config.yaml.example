@@ -1,0 +1,54 @@
+meituan:
+  login_url: https://waimaie.meituan.com/new_fe/login_gw#/login
+  chat_url: https://shangoue.meituan.com/imworkbench/home?appId=4&clientType=150006#/im/page/workbench/reception
+  bad_url_pattern: page/customer
+server:
+  admin_host: 0.0.0.0
+  admin_port: 3003
+  remote_browser_host: 0.0.0.0
+  remote_browser_port: 5901
+  auth_token: YOUR_SHOP1_TOKEN_HERE
+  remote_browser_public_url: http://YOUR_SERVER_IP:41171/
+  legacy_auth_tokens:
+  - YOUR_LEGACY_TOKEN_HERE
+browser:
+  headless: true
+  profile_dir: /home/ubuntu/.meituan-reply-bot/browser-profile
+  viewport:
+    width: 1440
+    height: 900
+  launch_args:
+  - --no-sandbox
+  - --disable-dev-shm-usage
+  - --disable-blink-features=AutomationControlled
+  pre_start_kill_chromium: false
+monitor:
+  poll_seconds: 2
+  keepalive_seconds: 60
+  max_conversations_per_scan: 8
+  response_cooldown_seconds: 3
+  startup_navigate: true
+  url_guard_enabled: true
+  url_guard_pattern: im/page/workbench/reception
+  url_guard_navigate_on_miss: true
+  warmup_seconds: 5
+  self_check_interval_seconds: 300
+  cookie_export_seconds: 300
+  keepalive_refresh_seconds: 1800
+  cookie_reload_check_seconds: 300
+replies:
+  first_message: 您好，请问有什么可以帮到您？（以上信息是店铺AI会话，如果有急事，请直接拨打门店电话联系 028-XXXXXXXX，店铺可能未能及时回复，请多包涵）
+  fallback: 您好，您的消息已收到，店铺会尽快为您处理。（本消息由店铺AI自动回复，如有急事请直接拨打门店电话联系 028-XXXXXXXX。）
+  rules:
+  - name: cigarettes
+    keywords:
+    - 烟
+    - 香烟
+    - 烟草
+    - yan
+    - xiangyan
+    - cigarette
+    - smoke
+    - y an
+    reply: 不好意思，本店不售卖香烟。（本消息由店铺AI自动回复，如有急事请直接拨打门店电话联系 028-XXXXXXXX。）
+  # ... add more rules as needed

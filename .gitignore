@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Logs
+logs/
+*.log
+
+# Cookies & state - NEVER commit these
+cookies/
+cookie_*.json
+state/
+*.db
+
+# Browser profiles
+browser-profile/
+profile-*/
+
+# Backups
+backups/
+*.bak
+*.bak-*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Config with secrets - use config.yaml.example instead
+config.yaml

@@ -1,0 +1,24 @@
+[Unit]
+Description=Meituan Waimai reply bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/meituan-reply-bot
+Environment=PYTHONUNBUFFERED=1
+# 改进：启动前杀掉残留 chromium，避免 systemd 拉起新进程时旧 Chromium 锁住 profile
+ExecStartPre=/usr/bin/pkill -9 -f 'browser-profile' || true
+ExecStartPre=/bin/sleep 2
+ExecStart=/home/ubuntu/meituan-reply-bot/run.sh
+Restart=always
+RestartSec=10
+# 改进：限制 5 分钟内最多重启 5 次，避免崩溃循环
+StartLimitIntervalSec=300
+StartLimitBurst=5
+MemoryAccounting=yes
+MemoryMax=2200M
+
+[Install]
+WantedBy=multi-user.target

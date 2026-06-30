@@ -1,0 +1,19 @@
+[Unit]
+Description=Meituan reply bot (shop2)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+[Service]
+Environment=TZ=Asia/Shanghai
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/meituan-reply-bot-shop2
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/ubuntu/meituan-reply-bot-shop2/run.sh
+Restart=always
+RestartSec=10
+MemoryAccounting=yes
+MemoryMax=2200M
+[Install]
+WantedBy=multi-user.target

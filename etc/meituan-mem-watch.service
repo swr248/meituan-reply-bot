@@ -1,0 +1,6 @@
+[Unit]
+Description=Meituan bot memory watchdog
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/meituan-mem-watch.sh

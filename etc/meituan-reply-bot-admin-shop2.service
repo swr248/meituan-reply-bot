@@ -1,0 +1,15 @@
+[Unit]
+Description=Meituan reply bot admin (shop2)
+After=network-online.target
+Wants=network-online.target
+[Service]
+Environment=TZ=Asia/Shanghai
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/meituan-reply-bot-shop2
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/ubuntu/meituan-reply-bot-shop2/admin.sh
+Restart=always
+RestartSec=10
+[Install]
+WantedBy=multi-user.target
