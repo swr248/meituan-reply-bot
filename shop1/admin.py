@@ -92,7 +92,7 @@ def _public_admin_url(server: Dict[str, Any]) -> str:
     browser_url = str(server.get("remote_browser_public_url", "") or "")
     parsed = urlparse(browser_url)
     scheme = parsed.scheme or "http"
-    host = parsed.hostname or "YOUR_SERVER_IP"
+    host = parsed.hostname or "103.236.96.82"
     return f"{scheme}://{host}:{public_port}"
 
 app = FastAPI(title="美团外卖自动回复机器人 管理台")
@@ -670,6 +670,67 @@ def api_test_rule(payload: TestIn, token: str = Query(...)) -> Dict[str, Any]:
     }
 
 
+class PromoWindowIn(BaseModel):
+    start: str
+    end: str
+
+
+class PromoSchedulerUpdate(BaseModel):
+    enabled: Optional[bool] = None
+    windows: Optional[List[PromoWindowIn]] = None
+
+
+@app.get("/api/promo-scheduler")
+def api_get_promo(token: str = Query(...)) -> Dict[str, Any]:
+    _check_token(token)
+    cfg = load_config(CONFIG_PATH)
+    sched = (cfg.get("promotion_scheduler") or {})
+    return {
+        "enabled": bool(sched.get("enabled", False)),
+        "check_interval_sec": int(sched.get("check_interval_sec", 30)),
+        "windows": list(sched.get("windows") or []),
+    }
+
+
+@app.post("/api/promo-scheduler")
+def api_set_promo(payload: PromoSchedulerUpdate, token: str = Query(...)) -> Dict[str, Any]:
+    _check_token(token)
+    cfg = load_config(CONFIG_PATH)
+
+    def _hhmm(s: str) -> bool:
+        try:
+            h, m = s.strip().split(":")[:2]
+            return 0 <= int(h) <= 23 and 0 <= int(m) <= 59
+        except Exception:
+            return False
+
+    new_windows = []
+    if payload.windows is not None:
+        if len(payload.windows) > 3:
+            raise HTTPException(400, "最多 3 段窗口")
+        for w in payload.windows:
+            if not (_hhmm(w.start) and _hhmm(w.end)):
+                raise HTTPException(400, f"时间格式错误：{w.start} / {w.end}，应为 HH:MM")
+            new_windows.append({"start": w.start, "end": w.end})
+
+    sched = cfg.setdefault("promotion_scheduler", {})
+    if payload.enabled is not None:
+        sched["enabled"] = bool(payload.enabled)
+    sched.setdefault("check_interval_sec", 30)
+    sched.setdefault("target_url", "https://waimaieapp.meituan.com/ad/v1/rpc?&#/subapp/isomor_sg_onestop/pages/onestop/index")
+    sched.setdefault("switch_selector", ".sg-onestop-header-switch")
+    sched["windows"] = new_windows
+
+    backup = BACKUP_DIR / f"config.{int(time.time())}.yaml"
+    try:
+        backup.write_text(CONFIG_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+    except Exception:
+        backup = None
+    with CONFIG_PATH.open("w", encoding="utf-8") as f:
+        yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
+    return {"ok": True, "backup": str(backup) if backup else "", "promotion_scheduler": sched}
+
+
 @app.get("/api/logs")
 def api_logs(token: str = Query(...), tail: int = 120) -> Dict[str, Any]:
     _check_token(token)
@@ -1235,6 +1296,26 @@ th{color:#93c5fd;font-weight:normal}
   </div>
 
   <div class="card">
+    <h2>推广定时开关</h2>
+    <div class="muted">美团"一站式推广"按时间段自动开/关。当前时间落在任一 [开始, 结束) 区间时开启，跨夜窗口也支持（开始>结束表示跨夜）。最多 3 段窗口。保存后立即生效，无需重启。</div>
+    <div class="row" style="align-items:center;margin-top:8px">
+      <label style="display:flex;align-items:center;gap:6px">
+        <input type="checkbox" id="promoEnabled"> 启用推广定时调度
+      </label>
+      <span id="promoStatus" class="muted"></span>
+    </div>
+    <table style="margin-top:8px">
+      <thead><tr><th>段</th><th>开始时间</th><th>结束时间</th></tr></thead>
+      <tbody id="promoWindows"></tbody>
+    </table>
+    <div style="margin-top:8px">
+      <button onclick="addPromoRow()">新增时段</button>
+      <button onclick="savePromo()" style="background:#16a34a">保存并立即生效</button>
+    </div>
+    <div id="promoHint" class="muted" style="margin-top:6px"></div>
+  </div>
+
+  <div class="card">
     <h2>测试状态重置</h2>
     <div class="muted">清理欢迎语和去重状态，便于重复测试；回复记录会保留。</div>
     <div class="row" style="margin-top:8px;align-items:center">
@@ -1691,7 +1772,8 @@ async function loadRuleBackups(){
 async function restoreRules(name){
   if (!confirm('确认恢复这个规则备份？恢复后需要重启机器人生效。')) return;
   await api(`/api/rules/restore?name=${encodeURIComponent(name)}`, {method:'POST'});
-  await loadRules();
+
+loadRules();
   await loadRuleBackups();
   document.getElementById('saveHint').innerHTML = '<span class="ok">已恢复备份。</span> 需要重启机器人后生效。';
   document.getElementById('restartAfterSave').style.display = 'inline-block';
@@ -1850,6 +1932,55 @@ async function loadLogs(){
 
 loadInstance();
 loadAccessLinks();
+async function loadPromo(){
+  try {
+    const r = await api('/api/promo-scheduler');
+    document.getElementById('promoEnabled').checked = !!r.enabled;
+    document.getElementById('promoStatus').textContent =
+      r.enabled ? '当前：已启用' : '当前：未启用（保存后调度器将停止动作）';
+    const tbody = document.getElementById('promoWindows');
+    tbody.innerHTML = '';
+    const wins = (r.windows && r.windows.length) ? r.windows : [];
+    if (!wins.length) { addPromoRow(); return; }
+    for (const w of wins) addPromoRow(w);
+  } catch(e) {
+    document.getElementById('promoHint').innerHTML = '<span class="bad">加载失败：'+esc(e.message)+'</span>';
+  }
+}
+function addPromoRow(w){
+  w = w || {start:'09:00', end:'12:00'};
+  const tbody = document.getElementById('promoWindows');
+  const tr = document.createElement('tr');
+  tr.innerHTML = `
+    <td class="muted">#${tbody.children.length+1}</td>
+    <td><input type="time" data-k="start" value="${esc(w.start||'')}"></td>
+    <td><input type="time" data-k="end" value="${esc(w.end||'')}"></td>
+    <td><button class="danger" onclick="this.closest('tr').remove()">删除</button></td>
+  `;
+  tbody.appendChild(tr);
+}
+async function savePromo(){
+  const rows = Array.from(document.querySelectorAll('#promoWindows tr'));
+  if (rows.length > 3) { alert('最多 3 段窗口'); return; }
+  const windows = [];
+  for (const tr of rows) {
+    const s = tr.querySelector('[data-k=start]').value;
+    const e = tr.querySelector('[data-k=end]').value;
+    if (!s || !e) { alert('请填写完整时间'); return; }
+    windows.push({start: s, end: e});
+  }
+  const enabled = document.getElementById('promoEnabled').checked;
+  try {
+    const r = await api('/api/promo-scheduler', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({enabled: enabled, windows: windows})});
+    document.getElementById('promoHint').innerHTML =
+      '<span class="ok">已保存。下一轮调度（约 '+(r.promotion_scheduler && r.promotion_scheduler.check_interval_sec || 30)+'s 内）即按新时段动作。</span>'
+      + (r.backup ? ' 旧配置已备份：'+esc(r.backup.split('/').pop()) : '');
+  } catch(e) {
+    document.getElementById('promoHint').innerHTML = '<span class="bad">保存失败：'+esc(e.message)+'</span>';
+  }
+}
+
 loadRules();
 loadRuleBackups();
 refresh();

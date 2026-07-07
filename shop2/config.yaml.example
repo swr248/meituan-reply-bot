@@ -4,10 +4,10 @@
   bad_url_pattern: page/customer
 server:
   admin_host: 0.0.0.0
-  admin_port: 3003
+  admin_port: 3004
   remote_browser_host: 0.0.0.0
-  remote_browser_port: 5901
-  auth_token: YOUR_SHOP1_TOKEN_HERE
+  remote_browser_port: 5902
+  auth_token: YOUR_SHOP2_TOKEN_HERE
   remote_browser_public_url: http://YOUR_SERVER_IP:41171/
   legacy_auth_tokens:
   - YOUR_LEGACY_TOKEN_HERE
