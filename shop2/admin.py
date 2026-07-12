@@ -19,6 +19,7 @@ import shutil
 import time
 from pathlib import Path
 from urllib.parse import urlparse
+from urllib import request
 from typing import Any, Dict, List, Optional
 
 import yaml
@@ -112,6 +113,8 @@ _SUF = _instance_suffix()
 SVC_BOT = f"meituan-reply-bot{_SUF}.service"
 SVC_ADMIN = f"meituan-reply-bot-admin{_SUF}.service"
 SVC_BROWSER = f"meituan-browser-control{_SUF}.service"
+SVC_CAPTURE = f"meituan-capture-meituan-reply-bot{_SUF}.service"
+CAPTURE_PORT = 5901 if not _SUF else 5902
 
 
 # ---------- 鉴权 ----------
@@ -184,6 +187,40 @@ def api_service(action: str, token: str = Query(...), unit: str = Query(...)) ->
         raise HTTPException(400, "bad unit")
 
     return _sudo_systemctl(action, unit)
+
+
+@app.post("/api/capture/{action}")
+def api_capture(action: str, token: str = Query(...)) -> Dict[str, Any]:
+    """noVNC 一键启停 capture 服务。start 阻塞到 health OK，stop 立即返回。"""
+    _check_token(token)
+    if action not in ("start", "stop", "status"):
+        raise HTTPException(400, "bad action")
+    if action == "status":
+        active = _service_status(SVC_CAPTURE).get("active", False)
+        return {"ok": True, "active": active, "unit": SVC_CAPTURE}
+    if action == "stop":
+        return _sudo_systemctl("stop", SVC_CAPTURE)
+    start_result = _sudo_systemctl("start", SVC_CAPTURE)
+    if not start_result.get("ok"):
+        return {"ok": False, "phase": "systemctl", "detail": start_result.get("stderr") or start_result.get("stdout")}
+    cfg = load_config(CONFIG_PATH)
+    server = cfg.get("server", {}) or {}
+    auth = _current_auth_token(server)
+    base = f"http://127.0.0.1:{CAPTURE_PORT}"
+    deadline = time.time() + 90
+    last: Dict[str, Any] = {}
+    while time.time() < deadline:
+        try:
+            with request.urlopen(f"{base}/api/health?token={auth}", timeout=3) as r:
+                payload = json.loads(r.read().decode())
+            last = payload
+            roles = payload.get("roles") or {}
+            if payload.get("ok") and roles.get("im") and roles.get("promo"):
+                return {"ok": True, "phase": "ready", "unit": SVC_CAPTURE, "health": payload}
+        except Exception as e:
+            last = {"err": str(e)}
+        time.sleep(2)
+    return {"ok": False, "phase": "timeout", "unit": SVC_CAPTURE, "health": last}
 
 
 @app.get("/api/remote-browser-url")
@@ -1160,6 +1197,16 @@ th{color:#93c5fd;font-weight:normal}
 <body>
 <div class="wrap">
   <h1>美团外卖自动回复机器人 管理台</h1>
+  <div class="card">
+    <h2>noVNC 登录浏览器</h2>
+    <div class="muted">capture 服务按需启动：点击下方按钮启动并在健康后打开登录浏览器；用完点停止即可释放内存。</div>
+    <div class="row" style="margin-top:8px;align-items:center">
+      <button id="captureStartBtn" onclick="startCapture(this)" style="background:#0ea5e9">一键启动 noVNC</button>
+      <button id="captureStopBtn" onclick="stopCapture(this)" class="danger">停止 capture</button>
+      <span id="captureStatus" class="muted">状态加载中...</span>
+      <a id="captureLink" class="tag" href="#" target="_blank" style="display:none">打开 noVNC</a>
+    </div>
+  </div>
   <div id="instanceBar" class="muted" style="margin:-8px 0 16px">实例加载中...</div>
 
   <div class="card">
@@ -1350,6 +1397,61 @@ th{color:#93c5fd;font-weight:normal}
 <script>
 const TOKEN = new URL(location.href).searchParams.get('token') || '';
 if (!TOKEN) document.body.innerHTML = '<div class="wrap"><h1>缺少 ?token= 参数</h1></div>';
+const NO_VNC_URL = '/vnc.html?autoconnect=true&resize=scale';
+
+async function refreshCaptureStatus(){
+  const statusEl = document.getElementById('captureStatus');
+  const link = document.getElementById('captureLink');
+  try {
+    const r = await api('/api/capture/status?token=' + encodeURIComponent(TOKEN), {method:'POST'});
+    if (r && r.ok && r.active) {
+      statusEl.textContent = '运行中，可打开 noVNC';
+      statusEl.className = 'ok';
+      link.href = NO_VNC_URL;
+      link.style.display = 'inline-block';
+      link.textContent = '打开 noVNC';
+    } else {
+      statusEl.textContent = '未运行';
+      statusEl.className = 'muted';
+      link.style.display = 'none';
+    }
+  } catch (e) {
+    statusEl.textContent = '查询失败';
+    statusEl.className = 'bad';
+  }
+}
+
+async function startCapture(btn){
+  btn.disabled = true; const old = btn.textContent; btn.textContent = '启动中...';
+  const statusEl = document.getElementById('captureStatus');
+  statusEl.textContent = '启动中，最长约 90 秒...';
+  statusEl.className = 'muted';
+  try {
+    const r = await api('/api/capture/start?token=' + encodeURIComponent(TOKEN), {method:'POST'});
+    if (r && r.ok) {
+      statusEl.textContent = '已就绪，可打开 noVNC';
+      statusEl.className = 'ok';
+      const link = document.getElementById('captureLink');
+      link.href = NO_VNC_URL; link.style.display = 'inline-block'; link.textContent = '打开 noVNC';
+    } else {
+      statusEl.textContent = '启动失败: ' + (r && (r.detail || (r.health && r.health.err)) || 'unknown');
+      statusEl.className = 'bad';
+    }
+  } finally {
+    btn.disabled = false; btn.textContent = old;
+  }
+}
+
+async function stopCapture(btn){
+  btn.disabled = true;
+  try {
+    await api('/api/capture/stop?token=' + encodeURIComponent(TOKEN), {method:'POST'});
+  } finally {
+    btn.disabled = false;
+    refreshCaptureStatus();
+  }
+}
+
 async function api(path, opts){
   const u = new URL(path, location.origin);
   u.searchParams.set('token', TOKEN);
