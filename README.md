@@ -2,114 +2,165 @@
 
 <div align="center">
 
-**多店铺版自动化客服助手** · 关键词回复 · 反重复发送 · Cookie 自动保活
+**多店铺自动化客服解决方案** · 关键词智能回复 · 防重复刷屏 · Cookie 持久化
 
 </div>
 
-## 📌 项目简介
+## 🎯 这是什么
 
-这是一个用于美团外卖 IM 工作台的多店铺自动回复系统，支持通过浏览器监听新会话、识别顾客消息并自动回复；并提供统一管理页进行运行与日志监控。
+面向美团外卖 IM 工作台的自动回复系统，支持多店铺独立运行。
+核心目标：**让顾客在有新消息时，机器人稳定、快速、可控地回复**。
 
-## ✨ 功能特性
+---
 
-| 模块 | 功能 |
-| --- | --- |
-| 消息监听 | 检测 `正在接待` 中出现倒计时（59s→1s）或 `超时未回复` 的会话 |
-| 自动回复策略 | 首条消息发送欢迎语；后续按规则匹配关键词；无匹配则走保底回复 |
-| 去重复策略 | 同一顾客在同一回复内容下最多重复发送 3 次，防止循环刷消息 |
-| 店铺隔离 | 支持多店铺独立运行，配置与端口互不干扰 |
-| 主管理 | 总览页集中查看店铺运行状态、内存、日志与服务控制 |
-| Cookie 管理 | 支持 cookie 导出/保活，失效告警 |
-| 自我识别 | 含店铺名、机器人标签（如 `[订单]`、`[机器人...]`）等识别为店方内容，不作为顾客消息处理 |
+## 🧩 功能速览
 
-## 🗂 目录结构
+- **消息监听**：自动识别“正在接待”中的顾客会话，依据倒计时/超时状态触发回复。
+- **回复策略**：
+  - 首条消息先发欢迎语（可自定义）。
+  - 后续消息按关键词匹配回复；无匹配时走保底回复。
+- **去重防刷**：
+  - 同一会话最多自动回复 3 次，避免页面状态异常时循环发送。
+  - 会话按订单号/门店新客 + 脱敏顾客名隔离，避免 `v**` 这类脱敏名跨会话误伤。
+- **店铺隔离**：多店铺独立配置（token、端口、Cookie、规则），互不干扰。
+- **统一监控**：总览页展示店铺状态、运行状态、内存占用、日志与告警。
+- **Cookie 生命周期管理**：导出/保活/异常提示。
+- **自我识别**：过滤含店铺名、机器人标签（`[订单]`、`[机器人...]`）的消息，避免误把店方消息当顾客消息。
+
+---
+
+## 🗂 项目结构
 
 ```text
 github-release/
-├── shop1/                      # 店铺1
-│   ├── bot.py                  # 核心 bot 逻辑
-│   ├── admin.py                # 分店管理页
-│   ├── config.yaml.example     # 配置模板（复制为 config.yaml）
-│   ├── rules.py                # 关键词匹配规则
-│   ├── state.py                # 状态持久化
-│   ├── cookie_sync.py          # Cookie 管理
-│   ├── remote_browser.py       # 远程浏览器/登录控制
-│   └── ...
-├── shop2/                      # 店铺2（结构同 shop1）
-├── master/                     # 总控管理台
+├── master/                    # 总控管理台（统一入口）
 │   └── master_admin.py
-├── etc/                        # systemd 服务与相关配置
-├── .github/workflows/ci.yml    # CI 配置
-├── .gitignore
-└── README.md
+├── shop1/                     # 店铺1（示例）
+│   ├── bot.py                 # 核心机器人逻辑
+│   ├── admin.py               # 店铺管理页
+│   ├── config.yaml.example    # 配置模板（复制为 config.yaml）
+│   ├── rules.py               # 关键词规则
+│   ├── state.py               # 状态/去重记录持久化
+│   ├── cookie_sync.py         # Cookie 导出与同步
+│   ├── remote_browser.py      # VNC 登录与浏览器控制
+│   └── ...
+├── shop2/                     # 店铺2（结构同 shop1）
+├── etc/                       # systemd 单元文件与部署文件
+├── .github/workflows/         # CI 配置
+├── .gitignore                 # 敏感文件忽略
+└── README.md                  # 当前说明文档
 ```
+
+---
 
 ## 🚀 快速开始
 
-### 1. 安装依赖
+### 1）安装依赖
 
 ```bash
 cd github-release
 pip install -r shop1/requirements.txt
 ```
 
-### 2. 配置店铺
+### 2）配置
+
+复制示例配置，并分别填写两家店的真实值：
 
 ```bash
 cp shop1/config.yaml.example shop1/config.yaml
 cp shop2/config.yaml.example shop2/config.yaml
 ```
 
-然后在 `config.yaml` 中填写：
+重点字段：
 
 - `token`
 - `server_port`
 - `service_port`
 - `phone`
-- `first_message` / `fallback` / `rules`
+- `first_message` / `fallback`
+- `rules`（关键词与回复）
 
-> ⚠️ 请不要提交 `config.yaml`，也不要上传 cookie、profile 等本地状态文件。
-
-### 3. 启动服务
+### 3）启动服务
 
 ```bash
-# 启动店铺服务（示例）
+# 启动店铺 bot
 sudo systemctl start meituan-reply-bot-shop1
 sudo systemctl start meituan-reply-bot-shop2
 
-# 启动主管理台
+# 启动统一管理台
 sudo systemctl start meituan-reply-bot-master
 ```
 
-## 🧪 运行校验
+### 4）访问界面
 
-- 管理页登录后检查 `运行中`、`倒计时/超时`、`错误次数` 是否正常
-- 首次启动后建议先在 IM 发一条测试消息验证回复链路
-- 如出现 `Cookie 需要重新导出`，请先在店铺对应浏览器中完成登录与导出
+```text
+主控： http://<server-ip>:<master_port>/
+店铺1： http://<server-ip>:<shop1_port>/
+店铺2： http://<server-ip>:<shop2_port>/
+```
 
-## 🛠️ 开发与测试
+请在管理台内确认 token 与服务状态后再操作。
+
+---
+
+## 🔁 回复规则（建议理解）
+
+- 检测到新消息（来自顾客）后即触发一次处理。
+- 首条：发送欢迎语。
+- 第二条起：先按关键词匹配回复。
+- 无命中：发送 fallback。
+- 遇到重复消息也会按规则处理，但同一会话受“最多 3 次自动回复”保护。
+
+---
+
+## 🧪 排障与自检
+
+常见排查顺序：
+
+1. 管理页是否显示 `运行中`。
+2. 会话列表是否出现倒计时（59s→1s）或超时提示。
+3. 最近日志里是否有 `scan`/`reply` 关键字。
+4. 若出现 cookie 告警，先到对应店铺浏览器页重新导出。
+
+建议动作：
+
+- 先发一条测试消息验证链路。
+- 若无回复，先检查系统时间、Cookie 有效期与页面状态。
+- 必要时重启对应店铺服务（或 master）后观察恢复。
+
+---
+
+## 🧰 开发与测试
 
 ```bash
 cd github-release
 pytest
 ```
 
-CI 已配置：`push` / `pull_request` 会自动执行上述测试（仅本地规则测试）。
+项目 CI 会在 `push` / `pull_request` 时执行测试。
 
-## 🧯 维护说明
+---
 
-- 运行日志会保留用于排障，建议定期清理旧日志
-- 如需恢复环境，可参考 `server-backup` 中的备份目录
+## 🛠 运维建议
+
+- 日志建议按 7 天轮转（可通过日志策略文件管理）。
+- 关键操作优先走管理页按钮，避免直接改配置导致服务不一致。
+- 变更前先备份配置/日志目录，方便回滚。
+
+---
 
 ## 🔐 安全说明
 
-- `config.yaml` 已被 `.gitignore` 排除，避免提交敏感信息
-- 仓库内 `config.yaml.example` 仅保留占位符
-- Cookie 与浏览器 profile 目录请勿提交到版本库
+- `config.yaml` 已在 `.gitignore` 中忽略，避免提交敏感信息。
+- 仓库内仅保留示例配置 `config.yaml.example`。
+- Cookie、浏览器 profile 与会话状态文件请勿提交。
+
+---
 
 ## 🧰 技术栈
 
-- Python 3 + Playwright
+- Python 3
+- Playwright
 - FastAPI
-- systemd（守护与自启动）
-- VNC（可视化登录）
+- systemd
+- VNC

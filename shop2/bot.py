@@ -50,6 +50,8 @@ COUNTDOWN_RE = re.compile(r"(?<!\d)(\d{1,2})\s*(?:s|sec|secs|second|seconds|秒)
 # 普通时间不算倒计时：18:47 / 17:05
 CLOCK_RE = re.compile(r"^\s*\d{1,2}:\d{2}\s*$")
 MASKED_NAME_RE = re.compile(r"[A-Za-z][*??]{1,4}")
+ORDER_SESSION_RE = re.compile(r"\d{1,3}\.\d{1,2}#\d+单")
+CARD_NOISE_TOKENS = ("已经到底啦", "待回复", "已回复", "超时未回复", "机器人", "客服", "门店新客", "已下")
 
 
 def parse_countdown(text: str) -> Optional[int]:
@@ -96,8 +98,8 @@ def card_has_pending_signal(text: str) -> bool:
     # "已回复" prefix means bot already replied to this card - skip it.
     if s.startswith("\u5df2\u56de\u590d"):
         return False
-    # "待回复" prefix or countdown/timeout means genuinely pending.
-    if parse_countdown(s) is not None or "\u8d85\u65f6\u672a\u56de\u590d" in s:
+    # "待回复" prefix is authoritative in Meituan IM.
+    if s.startswith("待回复") or parse_countdown(s) is not None or "\u8d85\u65f6\u672a\u56de\u590d" in s or "超时未回复" in s:
         return True
     if not any(tag in s for tag in (
         "[\u673a\u5668\u4eba\u5df2\u6682\u505c]",
@@ -556,9 +558,8 @@ class MeituanBot:
             has_order = "已下" in t  # "已下11单"
             has_time = bool(re.search(r"\d{1,2}:\d{2}", t))
             has_status = any(kw in t for kw in ("机器人", "客服", "推荐商品", "接待中"))
-            has_pending = "超时未回复" in t or "待回复" in t
-            # Must match: order info, or status+time, or pending signal.
-            if not (has_order or has_pending or (has_status and has_time)):
+            # 必须有"已下"或"机器人"+"时间"等组合
+            if not (has_order or (has_status and has_time)):
                 continue
             candidates.append((it, t))
             seen_texts.add(t)
@@ -569,9 +570,15 @@ class MeituanBot:
         seen_sessions = set()
         for item, txt in candidates:
             cust = self._extract_name_from_text(txt)
-            order_m = re.search(r"\d{1,3}\.\d{1,2}#\d+单", txt) or re.search(r"门店新客", txt)
+            order_m = ORDER_SESSION_RE.search(txt) or re.search(r"门店新客", txt)
             order = order_m.group(0) if order_m else "_"
-            key = (order, cust if cust != "unknown" else txt[:40])
+            masked = self._extract_masked_name_from_text(txt)
+            # Use only stable conversation identifiers for de-dupe. The same
+            # card can appear multiple times with extra footer/status text.
+            if order != "_":
+                key = (order, masked or "_")
+            else:
+                key = (masked or (cust if cust != "unknown" else txt[:40]),)
             if key in seen_sessions:
                 log.info("[scan] dedupe skip duplicate candidate key=%s cust=%s", key, cust)
                 continue
@@ -580,6 +587,7 @@ class MeituanBot:
 
         log.info("[scan] raw=%d candidates=%d unique=%d", len(raw_items), len(candidates), len(deduped))
         if not deduped:
+            # 没有候选时，dump 一次 DOM 辅助定位
             self._dump_dom_diagnostics(page, tag="scan-no-candidates")
             return False
 
@@ -615,7 +623,6 @@ class MeituanBot:
         return True
 
     def _open_and_reply(self, page: Page, item: Any, expected_customer: str = "", expected_card_text: str = "") -> None:
-
         # 直接点击过滤后的对话项（已通过"会话卡片"特征过滤，是真实的用户会话）
         try:
             item.click()
@@ -761,14 +768,23 @@ class MeituanBot:
             peer_idx = -1
 
         customer = expected_customer or self._extract_customer_name(item)
+        session_order = ""
+        try:
+            order_m = ORDER_SESSION_RE.search(expected_card_text or "") or re.search(r"门店新客", expected_card_text or "")
+            session_order = order_m.group(0) if order_m else ""
+        except Exception:
+            session_order = ""
+        session_key_src = "|".join([session_order or "_", customer or "unknown"])
+        import hashlib as _session_hashlib
+        session_key = _session_hashlib.md5(session_key_src.encode("utf-8")).hexdigest()[:12]
 
         # No customer message at all -> nothing to do
         if not last_text or last_text in ("[暂无消息]", "暂无消息", "加载中…", "加载中..."):
             log.debug("no inbound peer message for %s, skip", customer)
             return
 
-        # Per-customer welcome state (keyed by customer name only)
-        welcome_key = f"welcome_sent:{customer}"
+        # Per-session welcome state. Masked names like v** are not globally unique.
+        welcome_key = f"welcome_sent:{session_key}"
         welcome_sent_before = self.state.already_replied(welcome_key, ttl_seconds=86400)
 
         # 新消息判据：只看会话卡片是否处于待回复状态。
@@ -787,7 +803,7 @@ class MeituanBot:
 
         import hashlib as _hashlib
         peer_fp = _hashlib.md5(((last_text or "").strip()).encode("utf-8")).hexdigest()[:12]
-        wm_key = f"last_peer_fp:{customer}"
+        wm_key = f"last_peer_fp:{session_key}"
         last_fp = ""
         last_fp_age = 9999.0
         try:
@@ -801,8 +817,8 @@ class MeituanBot:
                 last_fp = _fp
         except Exception:
             last_fp = ""
-        log.info("watermark customer=%s pending=1 fp=%s last_fp=%s age=%.0fs peer_total=%s",
-                 customer, peer_fp, last_fp, last_fp_age, peer_total)
+        log.info("watermark customer=%s session=%s pending=1 fp=%s last_fp=%s age=%.0fs peer_total=%s",
+                 customer, session_key, peer_fp, last_fp, last_fp_age, peer_total)
         # Force reply when countdown or 超时未回复 is present - never skip.
         has_countdown = parse_countdown(card_text) is not None
         has_timeout = "超时未回复" in (card_text or "")
@@ -815,34 +831,19 @@ class MeituanBot:
             # No countdown/timeout but same bubble - skip to avoid loop
             log.info("watermark skip same visual bubble customer=%s fp=%s age=%.1fs", customer, peer_fp, last_fp_age)
             return
-        # Anti-loop: limit sending the SAME reply text to the same customer
-        # for a SPECIFIC message to MAX_SAME_REPLY (3) times.
-        # Keyed by (customer + message fingerprint + reply text) so that when
-        # the customer sends a new message the counter resets automatically.
-        MAX_SAME_REPLY = 3
-
-        def _same_reply_key(cust, msg_fp, reply_text):
-            import hashlib as _rh
-            return "same_reply:%s:%s:%s" % (
-                cust or "unknown",
-                msg_fp or "nofp",
-                _rh.md5((reply_text or "").strip().encode("utf-8")).hexdigest()[:12],
-            )
-
-        def _same_reply_exceeded(cust, msg_fp, reply_text):
-            try:
-                cnt = int(self.state.get_value(_same_reply_key(cust, msg_fp, reply_text)) or 0)
-            except Exception:
-                cnt = 0
-            return cnt >= MAX_SAME_REPLY
-
-        def _inc_same_reply(cust, msg_fp, reply_text):
-            k = _same_reply_key(cust, msg_fp, reply_text)
-            try:
-                cnt = int(self.state.get_value(k) or 0)
-            except Exception:
-                cnt = 0
-            self.state.set_value(k, str(cnt + 1))
+        # Per-session reply count limit: default 3 replies per session.
+        # Prevents infinite loop when the same bubble keeps being detected as pending.
+        MAX_REPLIES = 3
+        reply_count_key = f"reply_count:{session_key}"
+        reply_count = 0
+        try:
+            rc_raw = self.state.get_value(reply_count_key)
+            reply_count = int(rc_raw) if rc_raw else 0
+        except Exception:
+            reply_count = 0
+        if reply_count >= MAX_REPLIES:
+            log.info("reply limit reached (%d/%d) customer=%s - skip", reply_count, MAX_REPLIES, customer)
+            return
 
         decision = decide_reply(last_text, self.cfg, is_first_message=False)
         kw_hit = decision.rule not in ("first_message", "fallback")
@@ -853,15 +854,16 @@ class MeituanBot:
             # 才走 keyword/fallback 路线。
             welcome = decide_reply("", self.cfg, is_first_message=True)
             log.info("first peer msg for %s: sending first_message", customer)
-            if _same_reply_exceeded(customer, peer_fp, welcome.reply):
-                log.info("same-reply limit (%d) for welcome customer=%s - skip", MAX_SAME_REPLY, customer)
-            else:
-                ok = self._send_reply(page, welcome.reply)
-                if ok:
-                    self.state.mark_replied(welcome_key)
-                    self.last_cool = time.time()
-                    _inc_same_reply(customer, peer_fp, welcome.reply)
-                    log.info("sent welcome to %s", customer)
+            ok = self._send_reply(page, welcome.reply)
+            if ok:
+                self.state.mark_replied(welcome_key)
+                self.last_cool = time.time()
+                try:
+                    cur = int(self.state.get_value(reply_count_key) or 0)
+                except Exception:
+                    cur = 0
+                self.state.set_value(reply_count_key, str(cur + 1))
+                log.info("sent welcome to %s (reply_count=%d)", customer, cur + 1)
             self.state.set_value(wm_key, f"{peer_fp}|{time.time()}")
             self._record_reply_event(customer, last_text, "first_message", "first_message", welcome.reply, ok, peer_fp=peer_fp, card_text=card_text)
             return
@@ -869,27 +871,29 @@ class MeituanBot:
         # Subsequent peer messages: keyword reply if matched, otherwise fallback.
         if kw_hit:
             log.info("subsequent peer msg rule=%s", decision.rule)
-            if _same_reply_exceeded(customer, peer_fp, decision.reply):
-                log.info("same-reply limit (%d) for keyword rule=%s customer=%s - skip", MAX_SAME_REPLY, decision.rule, customer)
-            else:
-                ok = self._send_reply(page, decision.reply)
-                if ok:
-                    self.state.set_value(wm_key, f"{peer_fp}|{time.time()}")
-                    self.last_cool = time.time()
-                    _inc_same_reply(customer, peer_fp, decision.reply)
-                    log.info("sent keyword reply rule=%s", decision.rule)
+            ok = self._send_reply(page, decision.reply)
+            if ok:
+                self.state.set_value(wm_key, f"{peer_fp}|{time.time()}")
+                self.last_cool = time.time()
+                try:
+                    cur = int(self.state.get_value(reply_count_key) or 0)
+                except Exception:
+                    cur = 0
+                self.state.set_value(reply_count_key, str(cur + 1))
+                log.info("sent keyword reply rule=%s (reply_count=%d)", decision.rule, cur + 1)
             self._record_reply_event(customer, last_text, "keyword", decision.rule, decision.reply, ok, peer_fp=peer_fp, card_text=card_text)
         else:
             log.info("subsequent peer msg rule=fallback")
-            if _same_reply_exceeded(customer, peer_fp, decision.reply):
-                log.info("same-reply limit (%d) for fallback customer=%s - skip", MAX_SAME_REPLY, customer)
-            else:
-                ok = self._send_reply(page, decision.reply)
-                if ok:
-                    self.state.set_value(wm_key, f"{peer_fp}|{time.time()}")
-                    self.last_cool = time.time()
-                    _inc_same_reply(customer, peer_fp, decision.reply)
-                    log.info("sent fallback reply")
+            ok = self._send_reply(page, decision.reply)
+            if ok:
+                self.state.set_value(wm_key, f"{peer_fp}|{time.time()}")
+                self.last_cool = time.time()
+                try:
+                    cur = int(self.state.get_value(reply_count_key) or 0)
+                except Exception:
+                    cur = 0
+                self.state.set_value(reply_count_key, str(cur + 1))
+                log.info("sent fallback reply (reply_count=%d)", cur + 1)
             self._record_reply_event(customer, last_text, "fallback", decision.rule, decision.reply, ok, peer_fp=peer_fp, card_text=card_text)
 
     def _record_reply_event(self, customer: str, message: str, action: str, rule: str, reply: str, ok: bool, **extra: Any) -> None:
@@ -1011,29 +1015,33 @@ class MeituanBot:
         return None
 
     @staticmethod
-    def _extract_name_from_text(txt: str) -> str:
-        """从已经拿到的 candidate 文本里抠出客户名。
+    def _extract_masked_name_from_text(txt: str) -> str:
+        s = (txt or "").replace(" ", " ")
+        order_line = re.search(r"\d{1,3}\.\d{1,2}#\d+单\s+([A-Za-z][*?]{1,4})", s)
+        if order_line:
+            return order_line.group(1)
+        masked = MASKED_NAME_RE.search(s)
+        return masked.group(0) if masked else ""
 
-        和 _extract_customer_name 保持一致的规则，但直接吃字符串，
-        避免在第二次读取 item.inner_text() 时拿到已经变化的 DOM。
-        """
+    @staticmethod
+    def _extract_name_from_text(txt: str) -> str:
+        """从已经拿到的 candidate 文本里抠出客户名。"""
         if not txt:
             return "unknown"
-        BAD_PREFIXES = ("待回复", "已回复", "超时未回复", "机器人", "客服", "门店新客", "已下")
-        # Reject tokens that look like a countdown ("58s", "59") or a card label
-        # ("已经到底啦~", "已回复N"). Real customer names are short Chinese
-        # or masked Latin like "v**" / "w**".
-        COUNTDOWN_RE = re.compile(r"^\d{1,3}s?$")
-        tokens = [seg.strip().replace("\xa0", " ").strip()
+        masked = MeituanBot._extract_masked_name_from_text(txt)
+        if masked:
+            return masked
+        countdown_re = re.compile(r"^\d{1,3}s?$")
+        tokens = [seg.strip().replace(" ", " ").strip()
                   for seg in re.split(r"[\n|]+", txt or "")]
         for line in tokens:
             if not line:
                 continue
-            if any(line.startswith(p) for p in BAD_PREFIXES):
+            if any(tok in line for tok in CARD_NOISE_TOKENS):
                 continue
             if re.fullmatch(r"[\d:.\-/\s]+", line):
                 continue
-            if COUNTDOWN_RE.match(line):
+            if countdown_re.match(line):
                 continue
             if len(line) > 8:
                 continue
@@ -1045,28 +1053,7 @@ class MeituanBot:
             txt = (item.inner_text() or "").strip()
         except Exception:
             return "unknown"
-        BAD_PREFIXES = ("待回复", "已回复", "超时未回复", "机器人", "客服", "门店新客", "已下")
-        COUNTDOWN_RE = re.compile(r"^\d{1,3}s?$")
-        # Split by newline OR vertical bar OR multiple spaces
-        tokens = [seg.strip().replace("\xa0", " ").strip()
-                  for seg in re.split(r"[\n|]+", txt)]
-        for line in tokens:
-            if not line:
-                continue
-            if any(line.startswith(p) for p in BAD_PREFIXES):
-                continue
-            if re.fullmatch(r"[\d:.\-/\s]+", line):
-                continue
-            if COUNTDOWN_RE.match(line):
-                continue
-            if len(line) > 16:
-                continue
-            # Strong filter: real customer names are short (<= 8 chars) and
-            # often masked like 'v**' / 'w**' / Chinese 2-3 char.
-            if len(line) > 8:
-                continue
-            return line
-        return "unknown"
+        return self._extract_name_from_text(txt)
 
     def _send_reply(self, page, text):
         try:
