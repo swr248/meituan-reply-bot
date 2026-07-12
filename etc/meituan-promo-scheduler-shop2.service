@@ -1,0 +1,14 @@
+[Unit]
+Description=Meituan promotion scheduler (shop2)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ubuntu/meituan-reply-bot-shop2
+ExecStart=/home/ubuntu/meituan-reply-bot-shop2/.venv/bin/python -u /home/ubuntu/meituan-reply-bot-shop2/promo_scheduler.py --config /home/ubuntu/meituan-reply-bot-shop2/config.yaml
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
