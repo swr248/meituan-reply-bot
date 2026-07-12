@@ -2036,7 +2036,7 @@ loadInstance();
 loadAccessLinks();
 async function loadPromo(){
   try {
-    const r = await api('/api/promo-scheduler');
+    const r = await api('/api/promo-scheduler?token=' + encodeURIComponent(TOKEN));
     document.getElementById('promoEnabled').checked = !!r.enabled;
     document.getElementById('promoStatus').textContent =
       r.enabled ? '当前：已启用' : '当前：未启用（保存后调度器将停止动作）';
