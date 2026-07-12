@@ -2083,6 +2083,7 @@ async function savePromo(){
   }
 }
 
+loadPromo();
 loadRules();
 loadRuleBackups();
 refresh();
