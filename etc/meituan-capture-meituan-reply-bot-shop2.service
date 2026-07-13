@@ -1,0 +1,26 @@
+[Unit]
+Description=Cookie capture (shop2 im+promo, port 5902)
+After=network-online.target
+Wants=network-online.target
+Conflicts=meituan-capture-meituan-reply-bot.service
+StartLimitIntervalSec=600
+StartLimitBurst=20
+
+[Service]
+Slice=meituan.slice
+Environment=TZ=Asia/Shanghai
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/home/ubuntu/meituan-reply-bot-shop2
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/meituan-reply-bot-shop2/capture
+ExecStart=/home/ubuntu/meituan-reply-bot-shop2/.venv/bin/python -u /home/ubuntu/meituan-reply-bot-shop2/capture/cookie_capture.py --config /home/ubuntu/meituan-reply-bot-shop2/capture/config.yaml --main-config /home/ubuntu/meituan-reply-bot-shop2/config.yaml --port 5902 --shop meituan-reply-bot-shop2
+Restart=on-failure
+RestartSec=10
+MemoryAccounting=yes
+MemoryHigh=650M
+MemoryMax=900M
+TasksMax=256
+
+[Install]
+WantedBy=multi-user.target

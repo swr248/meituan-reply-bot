@@ -4,9 +4,10 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+Slice=meituan.slice
 Environment=TZ=Asia/Shanghai
 Environment=PYTHONUNBUFFERED=1
-Environment=MASTER_ADMIN_TOKEN=
+EnvironmentFile=/etc/meituan-master-admin.env
 Type=simple
 User=ubuntu
 WorkingDirectory=/home/ubuntu/meituan-master-admin

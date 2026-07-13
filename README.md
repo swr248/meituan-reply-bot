@@ -42,7 +42,7 @@ github-release/
 │   ├── rules.py               # 关键词规则
 │   ├── state.py               # 状态/去重记录持久化
 │   ├── cookie_sync.py         # Cookie 导出与同步
-│   ├── remote_browser.py      # VNC 登录与浏览器控制
+│   ├── capture/               # 按需 noVNC、Cookie 与推广浏览器
 │   └── ...
 ├── shop2/                     # 店铺2（结构同 shop1）
 ├── etc/                       # systemd 单元文件与部署文件
@@ -83,23 +83,31 @@ cp shop2/config.yaml.example shop2/config.yaml
 ### 3）启动服务
 
 ```bash
-# 启动店铺 bot
-sudo systemctl start meituan-reply-bot-shop1
-sudo systemctl start meituan-reply-bot-shop2
+# 常驻服务
+sudo systemctl enable --now meituan-reply-bot.service
+sudo systemctl enable --now meituan-reply-bot-shop2.service
+sudo systemctl enable --now meituan-reply-bot-admin.service
+sudo systemctl enable --now meituan-reply-bot-admin-shop2.service
+sudo systemctl enable --now meituan-master-admin.service
+sudo systemctl enable --now meituan-promo-scheduler-shop1.service
+sudo systemctl enable --now meituan-promo-scheduler-shop2.service
 
-# 启动统一管理台
-sudo systemctl start meituan-reply-bot-master
+# 20 小时 Cookie 刷新
+sudo systemctl enable --now meituan-cookie-watch@shop1.timer
+sudo systemctl enable --now meituan-cookie-watch@shop2.timer
+
+# capture 不启用开机自启，由管理页、Cookie watcher 或推广调度按需启动
 ```
 
 ### 4）访问界面
 
 ```text
-主控： http://<server-ip>:<master_port>/
+主控： http://<server-ip>:<master_port>/?token=<MASTER_ADMIN_TOKEN>
 店铺1： http://<server-ip>:<shop1_port>/
 店铺2： http://<server-ip>:<shop2_port>/
 ```
 
-请在管理台内确认 token 与服务状态后再操作。
+主控凭证通过 `/etc/meituan-master-admin.env` 配置。该文件必须为 root 所有并设置 `0600` 权限。
 
 ---
 
@@ -134,7 +142,10 @@ sudo systemctl start meituan-reply-bot-master
 
 ```bash
 cd github-release
-pytest
+python -m pytest -q \
+  shop1/test_rules.py shop2/test_rules.py \
+  shop1/test_bot_guards.py shop2/test_bot_guards.py \
+  shop1/test_promo_scheduler.py shop2/test_promo_scheduler.py
 ```
 
 项目 CI 会在 `push` / `pull_request` 时执行测试。
@@ -148,7 +159,19 @@ pytest
 - Cookie 保活默认每 **20 小时** 触发一次（`meituan-cookie-watch@.timer`）；
 - 触发时会临时启动对应店铺的 capture 服务，导出后自动停止；
 - 推广定时开关由 `meituan-promo-scheduler-shop{1,2}.service` 常驻但轻量；
-- 推广调度仅在期望状态变化时启动 capture，完成后自动停止，节省内存。
+- 推广调度在期望状态变化时立即启动 capture，成功后默认每 1 小时复核一次；失败按 30 秒主循环重试；
+- 推广状态写入 `promo_scheduler_status.json`，管理页会显示“按时间应开启/关闭”和“实际开启/关闭”。
+
+### 🧠 4GB 内存运行
+
+- capture 使用按需启动，并通过 `/run/meituan-capture-global.lock` 串行化，避免两店 capture 同时启动；
+- bot 空闲后会完整重建浏览器栈，释放 Chromium/Playwright 长期累积内存；
+- systemd 对每个 bot 设置 `MemoryHigh=1200M`、`MemoryMax=1500M`；capture 设置 `MemoryHigh=650M`、`MemoryMax=900M`；
+- `meituan.slice` 总预算为 `MemoryHigh=2200M`、`MemoryMax=2700M`，适配 4GB 主机并保留系统余量；
+- 旧 `meituan-browser-control*.service` 已退役并应保持 masked，唯一浏览器入口是 capture。
+- `/etc/tmpfiles.d/meituan-capture-locks.conf` 统一创建跨服务 capture 锁；admin、推广调度和 Cookie watcher 不会互相接管浏览器会话。
+- 内存看门狗默认超过 `1100MB` 会重启对应 bot；
+- 建议启用 2GB swap 作为 4GB 机器兜底。
 
 - 日志建议按 7 天轮转（可通过日志策略文件管理）。
 - 关键操作优先走管理页按钮，避免直接改配置导致服务不一致。

@@ -14,8 +14,10 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import subprocess
 import shutil
+import threading
 import time
 from pathlib import Path
 from urllib.parse import urlparse
@@ -24,12 +26,13 @@ from typing import Any, Dict, List, Optional
 
 import yaml
 from fastapi import Body, FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
 
 from browser_common import load_config, log
 from cookie_sync import cookie_file_exists, cookie_file_age_seconds, cookie_file_path
 from rules import decide_reply
+from auth_ticket import consume_ticket, issue_ticket
 
 ROOT = Path(__file__).resolve().parent
 STATE_DIR = ROOT / "state"
@@ -112,9 +115,43 @@ def _instance_suffix():
 _SUF = _instance_suffix()
 SVC_BOT = f"meituan-reply-bot{_SUF}.service"
 SVC_ADMIN = f"meituan-reply-bot-admin{_SUF}.service"
-SVC_BROWSER = f"meituan-browser-control{_SUF}.service"
 SVC_CAPTURE = f"meituan-capture-meituan-reply-bot{_SUF}.service"
+SVC_BROWSER = SVC_CAPTURE
+SVC_COOKIE_WATCH = f"meituan-cookie-watch@{'shop2' if _SUF == '-shop2' else 'shop1'}.service"
 CAPTURE_PORT = 5901 if not _SUF else 5902
+_AUTH_SESSIONS: Dict[str, float] = {}
+_AUTH_SESSION_LOCK = threading.Lock()
+_AUTH_SESSION_TTL = 600
+_CAPTURE_OWNER_LOCK = threading.Lock()
+_CAPTURE_OWNER_FILE = None
+_CAPTURE_GLOBAL_LOCK = Path("/run/meituan-capture-global.lock")
+
+
+def _shop_id() -> str:
+    return "shop2" if _SUF == "-shop2" else "shop1"
+
+
+def _issue_auth_session() -> str:
+    token = secrets.token_urlsafe(32)
+    now = time.time()
+    with _AUTH_SESSION_LOCK:
+        expired = [key for key, expires in _AUTH_SESSIONS.items() if expires < now]
+        for key in expired:
+            _AUTH_SESSIONS.pop(key, None)
+        _AUTH_SESSIONS[token] = now + _AUTH_SESSION_TTL
+    return token
+
+
+def _auth_session_valid(token: Optional[str]) -> bool:
+    if not token:
+        return False
+    now = time.time()
+    with _AUTH_SESSION_LOCK:
+        expires = _AUTH_SESSIONS.get(token, 0)
+        if expires < now:
+            _AUTH_SESSIONS.pop(token, None)
+            return False
+        return True
 
 
 # ---------- 鉴权 ----------
@@ -125,8 +162,20 @@ def _check_token(token: Optional[str]) -> None:
     valid_tokens = _server_tokens(server)
     if not expected or expected == "CHANGE_ME_TO_A_LONG_RANDOM_STRING":
         raise HTTPException(500, "auth_token not set in config.yaml")
-    if not token or token not in valid_tokens:
+    if (not token or token not in valid_tokens) and not _auth_session_valid(token):
         raise HTTPException(401, "invalid token")
+
+
+@app.get("/auth/exchange")
+def auth_exchange(ticket: str = Query(...)) -> RedirectResponse:
+    cfg = load_config(CONFIG_PATH)
+    secret = _current_auth_token(cfg.get("server", {}) or {})
+    try:
+        consume_ticket(ticket, secret, _shop_id(), target="admin")
+    except ValueError as exc:
+        raise HTTPException(401, "invalid auth ticket") from exc
+    session = _issue_auth_session()
+    return RedirectResponse(f"/?token={session}", status_code=302)
 
 
 # ---------- systemd 包装 ----------
@@ -145,6 +194,40 @@ def _sudo_systemctl(action: str, unit: str) -> Dict[str, Any]:
         return {"ok": False, "stderr": str(e), "exit": -1}
 
 
+def _try_acquire_capture_owner() -> bool:
+    import fcntl
+
+    global _CAPTURE_OWNER_FILE
+    with _CAPTURE_OWNER_LOCK:
+        if _CAPTURE_OWNER_FILE is not None:
+            return True
+        handle = open(_CAPTURE_GLOBAL_LOCK, "w")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            handle.close()
+            return False
+        _CAPTURE_OWNER_FILE = handle
+        return True
+
+
+def _release_capture_owner() -> None:
+    import fcntl
+
+    global _CAPTURE_OWNER_FILE
+    with _CAPTURE_OWNER_LOCK:
+        handle = _CAPTURE_OWNER_FILE
+        _CAPTURE_OWNER_FILE = None
+        if handle is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            handle.close()
+
+
+def _manual_capture_owned() -> bool:
+    with _CAPTURE_OWNER_LOCK:
+        return _CAPTURE_OWNER_FILE is not None
+
+
 def _service_status(unit: str) -> Dict[str, Any]:
     systemctl_path = subprocess.run(["which", "systemctl"], capture_output=True, text=True).stdout.strip() or "/bin/systemctl"
     r = subprocess.run([systemctl_path, "is-active", unit], capture_output=True, text=True, timeout=8)
@@ -161,10 +244,49 @@ def _service_status(unit: str) -> Dict[str, Any]:
     return {"active": active, "raw": info}
 
 
+def _classify_business_health(session: Dict[str, Any], now: Optional[float] = None) -> Dict[str, Any]:
+    now = time.time() if now is None else now
+    timestamp = float(session.get("timestamp", 0) or 0)
+    url = str(session.get("url", "") or "")
+    age = max(0.0, now - timestamp) if timestamp else None
+    lowered = url.lower()
+    if not timestamp:
+        status = "missing"
+    elif "nopermission" in lowered:
+        status = "no_permission"
+    elif any(marker in lowered for marker in ("passport", "login", "signin")):
+        status = "login_required"
+    elif age is not None and age > 120:
+        status = "stale"
+    else:
+        status = "healthy"
+    return {"ok": status == "healthy", "status": status, "url": url, "age_seconds": age, "last_status": session.get("last_status", "")}
+
+
+def _business_health() -> Dict[str, Any]:
+    path = _runtime_state_dir() / "last_session.json"
+    try:
+        session = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except Exception as exc:
+        return {"ok": False, "status": "invalid", "path": str(path), "error": str(exc)}
+    result = _classify_business_health(session)
+    result["path"] = str(path)
+    return result
+
+
 # ---------- API ----------
 @app.get("/health")
 def health() -> Dict[str, Any]:
     return {"ok": True, "ts": time.time()}
+
+
+@app.on_event("shutdown")
+def _stop_owned_capture_on_shutdown() -> None:
+    if _manual_capture_owned():
+        try:
+            _sudo_systemctl("stop", SVC_CAPTURE)
+        finally:
+            _release_capture_owner()
 
 
 @app.get("/api/status")
@@ -174,6 +296,7 @@ def api_status(token: str = Query(...)) -> Dict[str, Any]:
         "bot": _service_status(SVC_BOT),
         "admin": _service_status(SVC_ADMIN),
         "browser": _service_status(SVC_BROWSER),
+        "business_health": _business_health(),
         "system_mem": _system_mem(),
     }
 
@@ -183,7 +306,7 @@ def api_service(action: str, token: str = Query(...), unit: str = Query(...)) ->
     _check_token(token)
     if action not in ("start", "stop", "restart"):
         raise HTTPException(400, "bad action")
-    if unit not in (SVC_BOT, SVC_BROWSER):
+    if unit != SVC_BOT:
         raise HTTPException(400, "bad unit")
 
     return _sudo_systemctl(action, unit)
@@ -197,11 +320,22 @@ def api_capture(action: str, token: str = Query(...)) -> Dict[str, Any]:
         raise HTTPException(400, "bad action")
     if action == "status":
         active = _service_status(SVC_CAPTURE).get("active", False)
-        return {"ok": True, "active": active, "unit": SVC_CAPTURE}
+        return {"ok": True, "active": active, "manual_owner": _manual_capture_owned(), "unit": SVC_CAPTURE}
     if action == "stop":
-        return _sudo_systemctl("stop", SVC_CAPTURE)
+        if not _manual_capture_owned():
+            raise HTTPException(409, "capture is not owned by this manual session")
+        try:
+            return _sudo_systemctl("stop", SVC_CAPTURE)
+        finally:
+            _release_capture_owner()
+    already_owned = _manual_capture_owned()
+    if not _try_acquire_capture_owner():
+        raise HTTPException(409, "capture is busy with scheduler or cookie refresh")
+    if not already_owned and _service_status(SVC_CAPTURE).get("active", False):
+        _sudo_systemctl("stop", SVC_CAPTURE)
     start_result = _sudo_systemctl("start", SVC_CAPTURE)
     if not start_result.get("ok"):
+        _release_capture_owner()
         return {"ok": False, "phase": "systemctl", "detail": start_result.get("stderr") or start_result.get("stdout")}
     cfg = load_config(CONFIG_PATH)
     server = cfg.get("server", {}) or {}
@@ -211,29 +345,32 @@ def api_capture(action: str, token: str = Query(...)) -> Dict[str, Any]:
     last: Dict[str, Any] = {}
     while time.time() < deadline:
         try:
-            with request.urlopen(f"{base}/api/health?token={auth}", timeout=3) as r:
+            with request.urlopen(f"{base}/api/health?token={auth}&role=im", timeout=3) as r:
                 payload = json.loads(r.read().decode())
             last = payload
             roles = payload.get("roles") or {}
-            if payload.get("ok") and roles.get("im") and roles.get("promo"):
+            if payload.get("ok") and roles.get("im"):
                 return {"ok": True, "phase": "ready", "unit": SVC_CAPTURE, "health": payload}
         except Exception as e:
             last = {"err": str(e)}
         time.sleep(2)
+    _sudo_systemctl("stop", SVC_CAPTURE)
+    _release_capture_owner()
     return {"ok": False, "phase": "timeout", "unit": SVC_CAPTURE, "health": last}
 
 
 @app.get("/api/remote-browser-url")
 def api_remote_browser_url(token: str = Query(...)) -> Dict[str, Any]:
-    """返回登录浏览器的公网入口 URL（带 token）。"""
+    """返回登录浏览器的短期授权入口。"""
     _check_token(token)
     cfg = load_config(CONFIG_PATH)
     server = cfg.get("server", {}) or {}
     base = server.get("remote_browser_public_url", "").rstrip("/")
-    auth = _current_auth_token(server)
-    if not base or not auth:
+    secret = _current_auth_token(server)
+    if not base or not secret:
         raise HTTPException(500, "remote_browser_public_url or auth_token not configured")
-    return {"url": f"{base}/?token={auth}", "token_fingerprint": _token_fingerprint(auth), "legacy_tokens": _token_compat_count(server)}
+    ticket = issue_ticket(secret, _shop_id(), "browser", ttl=60)
+    return {"url": f"{base}/auth/exchange?ticket={ticket}", "token_fingerprint": _token_fingerprint(secret), "legacy_tokens": _token_compat_count(server)}
 
 
 @app.get("/api/units")
@@ -358,21 +495,29 @@ def _shop_entry(name: str, root: Path) -> Dict[str, Any]:
     cfg = load_config(cfg_path)
     server = cfg.get("server", {}) or {}
     suffix = server.get("instance_suffix", "") or ""
+    shop_id = "shop2" if suffix == "-shop2" else "shop1"
+    secret = _current_auth_token(server)
+    admin_url = _public_admin_url(server)
+    browser_url = (server.get("remote_browser_public_url", "") or "").rstrip("/")
+    admin_ticket = issue_ticket(secret, shop_id, "admin", ttl=60) if secret else ""
+    browser_ticket = issue_ticket(secret, shop_id, "browser", ttl=60) if secret else ""
+    capture_unit = f"meituan-capture-meituan-reply-bot{suffix}.service"
     return {
         "name": name,
         "root": str(root),
         "admin_port": server.get("admin_port"),
-        "admin_url": _public_admin_url(server),
-        "remote_browser_url": (server.get("remote_browser_public_url", "") or "").rstrip("/"),
+        "admin_url": admin_url,
+        "remote_browser_url": browser_url,
+        "admin_open_url": f"{admin_url}/auth/exchange?ticket={admin_ticket}" if admin_url and admin_ticket else "",
+        "browser_open_url": f"{browser_url}/auth/exchange?ticket={browser_ticket}" if browser_url and browser_ticket else "",
         "token_fingerprint": _token_fingerprint(_current_auth_token(server)),
         "legacy_token_count": _token_compat_count(server),
-        "link_token": _current_auth_token(server),
         "bot_unit": f"meituan-reply-bot{suffix}.service",
         "admin_unit": f"meituan-reply-bot-admin{suffix}.service",
-        "browser_unit": f"meituan-browser-control{suffix}.service",
+        "browser_unit": capture_unit,
         "bot": _service_status(f"meituan-reply-bot{suffix}.service"),
         "admin": _service_status(f"meituan-reply-bot-admin{suffix}.service"),
-        "browser": _service_status(f"meituan-browser-control{suffix}.service"),
+        "browser": _service_status(capture_unit),
         "cookie": _cookie_status_for_config(cfg),
     }
 
@@ -599,11 +744,7 @@ def api_isolation(token: str = Query(...)) -> Dict[str, Any]:
 @app.get("/api/shops")
 def api_shops(token: str = Query(...)) -> Dict[str, Any]:
     _check_token(token)
-    shops = [
-        _shop_entry("shop1 北三环", Path("/home/ubuntu/meituan-reply-bot")),
-        _shop_entry("shop2 人民南路", Path("/home/ubuntu/meituan-reply-bot-shop2")),
-    ]
-    return {"shops": shops}
+    return {"shops": [_shop_entry("shop2 人民南路" if _SUF else "shop1 北三环", ROOT)]}
 
 
 @app.get("/api/cookie-status")
@@ -717,6 +858,52 @@ class PromoSchedulerUpdate(BaseModel):
     windows: Optional[List[PromoWindowIn]] = None
 
 
+def _apply_promo_update(sched: Dict[str, Any], enabled: Optional[bool], windows: Optional[List[Dict[str, str]]]) -> None:
+    if enabled is not None:
+        sched["enabled"] = bool(enabled)
+    if windows is not None:
+        sched["windows"] = windows
+
+
+def _promo_parse_hhmm(value: str) -> int:
+    h, m = str(value).strip().split(":")[:2]
+    return int(h) * 60 + int(m)
+
+
+def _promo_desired_now(windows: List[Dict[str, Any]]) -> str:
+    now = time.localtime()
+    now_min = now.tm_hour * 60 + now.tm_min
+    for window in windows or []:
+        try:
+            start = _promo_parse_hhmm(str(window.get("start", "")))
+            end = _promo_parse_hhmm(str(window.get("end", "")))
+        except Exception:
+            continue
+        if start == end:
+            continue
+        if start < end and start <= now_min < end:
+            return "on"
+        if start > end and (now_min >= start or now_min < end):
+            return "on"
+    return "off"
+
+
+def _read_promo_runtime() -> Dict[str, Any]:
+    path = _runtime_state_dir() / "promo_scheduler_status.json"
+    if not path.exists():
+        return {"exists": False, "path": str(path)}
+    try:
+        data = json.load(path.open("r", encoding="utf-8"))
+        if not isinstance(data, dict):
+            data = {}
+        data["exists"] = True
+        data["path"] = str(path)
+        data["age_seconds"] = max(0, int(time.time() - path.stat().st_mtime))
+        return data
+    except Exception as e:
+        return {"exists": False, "path": str(path), "error": str(e)}
+
+
 @app.get("/api/promo-scheduler")
 def api_get_promo(token: str = Query(...)) -> Dict[str, Any]:
     _check_token(token)
@@ -726,6 +913,8 @@ def api_get_promo(token: str = Query(...)) -> Dict[str, Any]:
         "enabled": bool(sched.get("enabled", False)),
         "check_interval_sec": int(sched.get("check_interval_sec", 30)),
         "windows": list(sched.get("windows") or []),
+        "desired_now": _promo_desired_now(list(sched.get("windows") or [])),
+        "runtime": _read_promo_runtime(),
     }
 
 
@@ -751,12 +940,10 @@ def api_set_promo(payload: PromoSchedulerUpdate, token: str = Query(...)) -> Dic
             new_windows.append({"start": w.start, "end": w.end})
 
     sched = cfg.setdefault("promotion_scheduler", {})
-    if payload.enabled is not None:
-        sched["enabled"] = bool(payload.enabled)
+    _apply_promo_update(sched, payload.enabled, new_windows if payload.windows is not None else None)
     sched.setdefault("check_interval_sec", 30)
     sched.setdefault("target_url", "https://waimaieapp.meituan.com/ad/v1/rpc?&#/subapp/isomor_sg_onestop/pages/onestop/index")
     sched.setdefault("switch_selector", ".sg-onestop-header-switch")
-    sched["windows"] = new_windows
 
     backup = BACKUP_DIR / f"config.{int(time.time())}.yaml"
     try:
@@ -850,19 +1037,15 @@ def api_alerts(token: str = Query(...)) -> Dict[str, Any]:
     cookie = _cookie_status_for_config(cfg)
     if not status.get("bot", {}).get("active"):
         alerts.append({"level": "bad", "title": "机器人未运行", "detail": "bot service 当前不是 active"})
+    business = status.get("business_health", {}) or {}
+    if status.get("bot", {}).get("active") and not business.get("ok"):
+        alerts.append({"level": "bad", "title": "机器人业务状态异常", "detail": f"状态={business.get('status', 'unknown')} URL={business.get('url', '')}"[:240]})
     cookie_status = cookie.get("status", "valid")
     browser_active = bool(status.get("browser", {}).get("active"))
     if cookie_status == "login_required":
         alerts.append({"level": "bad", "title": "登录账号已失效", "detail": "请手动打开登录浏览器重新登录，登录后系统会自动导出 Cookie。"})
     elif cookie_status in ("none", "stale") and not browser_active:
-        try:
-            r = _sudo_systemctl("start", SVC_BROWSER)
-            if r.get("ok"):
-                alerts.append({"level": "warn", "title": "Cookie 正在自动续期", "detail": "已启动登录浏览器，等待首次 keepalive 导出。"})
-            else:
-                alerts.append({"level": "bad", "title": "Cookie 未导出 / 可能失效", "detail": (cookie.get("status_text", "") + " / " + (cookie.get("age_display") or "") + " · 启动服务失败: " + (r.get("stderr") or r.get("stdout") or "unknown"))[:240]})
-        except Exception as e:
-            alerts.append({"level": "bad", "title": "Cookie 未导出 / 可能失效", "detail": (cookie.get("status_text", "") + " / " + (cookie.get("age_display") or "") + " · 启动异常: " + str(e))[:240]})
+        alerts.append({"level": "warn", "title": "Cookie 等待续期", "detail": (cookie.get("status_text", "") + " / " + (cookie.get("age_display") or "") + "；可手动触发或等待定时续期。")[:240]})
     elif cookie_status == "renewing":
         pass  # 保活中，不报警
     elif cookie_status == "stale" and browser_active:
@@ -908,54 +1091,19 @@ def _try_stop_browser_service() -> Dict[str, Any]:
 
 
 def _try_auto_refresh_cookies() -> Dict[str, Any]:
-    """尝试自动续 cookie：检查状态，如需要则启动登录浏览器，等 keepalive 导出。
-    成功后默认关闭浏览器节省内存，如果需要手动登录则保留。"""
+    """触发与 20 小时定时任务相同的 Cookie 刷新流程。"""
     cfg = load_config(CONFIG_PATH)
     cookie = _cookie_status_for_config(cfg)
-    ka = cookie.get("keepalive", {}) or {}
-    if ka.get("manual_login_needed"):
-        try:
-            if not _service_status(SVC_BROWSER).get("active"):
-                _sudo_systemctl("start", SVC_BROWSER)
-        except Exception:
-            pass
-        return {"ok": False, "manual_login_needed": True, "reason": "keepalive 检测到需要手动登录，已保留登录浏览器", "last_url": ka.get("last_url", "")}
     if cookie.get("status") == "valid":
-        stop = _try_stop_browser_service()
-        return {"ok": True, "skipped": True, "reason": "cookie 有效，已关闭登录浏览器节省内存", "cookie": cookie, "stop_result": stop}
-    browser_active = False
-    try:
-        browser_active = bool(_service_status(SVC_BROWSER).get("active"))
-    except Exception:
-        browser_active = False
-    if not browser_active:
-        r = _sudo_systemctl("start", SVC_BROWSER)
-        if not r.get("ok"):
-            return {"ok": False, "reason": "启动登录浏览器失败: " + (r.get("stderr") or r.get("stdout") or "unknown")}
-    deadline = time.time() + 150
-    last: Dict[str, Any] = {}
-    sf = Path(_state_dir_for_config(ROOT, cfg)) / "cookie_status.json"
-    started_at = time.time()
-    while time.time() < deadline:
-        try:
-            data = json.loads(sf.read_text(encoding="utf-8"))
-            last = data
-            ts = float(data.get("last_check_ts", 0) or 0)
-            fresh = ts > started_at - 5
-            if data.get("logged_in") and not data.get("manual_login_needed") and fresh:
-                cnt = 0
-                try:
-                    cnt = int((json.loads(cookie_file_path(cfg).read_text(encoding="utf-8")) or {}).get("cookie_count", 0) or 0)
-                except Exception:
-                    pass
-                stop = _try_stop_browser_service()
-                return {"ok": True, "cookie_count": cnt, "reason": "已启动 keepalive 并导出新 cookie，随后关闭浏览器节省内存", "stop_result": stop}
-            if data.get("manual_login_needed") and fresh:
-                return {"ok": False, "manual_login_needed": True, "reason": "keepalive 报需手动登录，已保留登录浏览器", "last_url": data.get("last_url", "")}
-        except Exception:
-            pass
-        time.sleep(2)
-    return {"ok": False, "reason": "超时：keepalive 150s 内未完成 cookie 导出", "last_status": last}
+        return {"ok": True, "skipped": True, "reason": "Cookie 当前有效，无需续期", "cookie": cookie}
+    result = _sudo_systemctl("start", SVC_COOKIE_WATCH)
+    return {
+        "ok": bool(result.get("ok")),
+        "started": bool(result.get("ok")),
+        "unit": SVC_COOKIE_WATCH,
+        "reason": "Cookie 刷新任务已触发" if result.get("ok") else "Cookie 刷新任务启动失败",
+        "detail": result.get("stderr") or result.get("stdout") or "",
+    }
 
 
 @app.post("/api/auto-refresh-cookies")
@@ -1162,7 +1310,7 @@ function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&l
 function state(unit){return unit&&unit.active?'<span class="ok">运行中</span>':'<span class="bad">已停止</span>';}
 function cookie(c){if(!c)return '<span class="warn">未知</span>'; return c.status==='valid'?`<span class="ok">有效</span> ${esc(c.age_display||'')}`:`<span class="warn">${esc(c.status_text||'异常')}</span>`;}
 async function api(path){const u=new URL(path,location.origin);u.searchParams.set('token',TOKEN);const r=await fetch(u);if(!r.ok)throw new Error(await r.text());return r.json();}
-async function load(){const r=await api('/api/shops');const box=document.getElementById('shops');box.innerHTML=(r.shops||[]).map(s=>{const t=encodeURIComponent(s.link_token||TOKEN);const admin=(s.admin_url||location.origin).replace(/\/$/,'')+'/shop?token='+t;const browser=s.remote_browser_url?String(s.remote_browser_url).replace(/\/$/,'')+'/?token='+t:'#';return `<div class="card"><b>${esc(s.name)}</b><div style="margin-top:10px">机器人：${state(s.bot)}<br>登录浏览器：${state(s.browser)}<br>Cookie：${cookie(s.cookie)}</div><a class="btn" href="${admin}">进入店铺管理</a><a class="btn secondary" href="${browser}" target="_blank" rel="noopener">打开登录浏览器</a><div class="muted small">管理外网：${esc(s.admin_url||'-')}<br>浏览器外网：${esc(s.remote_browser_url||'-')}<br>Token：${esc(s.token_fingerprint||'-')}</div></div>`}).join('')||'<div class="muted">暂无店铺</div>';}
+async function load(){const r=await api('/api/shops');const box=document.getElementById('shops');box.innerHTML=(r.shops||[]).map(s=>{const admin=s.admin_open_url||'#';const browser=s.browser_open_url||'#';return `<div class="card"><b>${esc(s.name)}</b><div style="margin-top:10px">机器人：${state(s.bot)}<br>登录浏览器：${state(s.browser)}<br>Cookie：${cookie(s.cookie)}</div><a class="btn" href="${admin}">进入店铺管理</a><a class="btn secondary" href="${browser}" target="_blank" rel="noopener">打开登录浏览器</a><div class="muted small">管理外网：${esc(s.admin_url||'-')}<br>浏览器外网：${esc(s.remote_browser_url||'-')}<br>Token：${esc(s.token_fingerprint||'-')}</div></div>`}).join('')||'<div class="muted">暂无店铺</div>';}
 load().catch(e=>{document.getElementById('shops').innerHTML='<span class="bad">加载失败：'+esc(e.message)+'</span>';});
 </script></div></body></html>"""
 
@@ -1204,7 +1352,7 @@ th{color:#93c5fd;font-weight:normal}
       <button id="captureStartBtn" onclick="startCapture(this)" style="background:#0ea5e9">一键启动 noVNC</button>
       <button id="captureStopBtn" onclick="stopCapture(this)" class="danger">停止 capture</button>
       <span id="captureStatus" class="muted">状态加载中...</span>
-      <a id="captureLink" class="tag" href="#" target="_blank" style="display:none">打开 noVNC</a>
+      <a id="captureLink" class="tag" href="#" target="_blank" style="display:none" onclick="openRemoteBrowser(event)">打开 noVNC</a>
     </div>
   </div>
   <div id="instanceBar" class="muted" style="margin:-8px 0 16px">实例加载中...</div>
@@ -1360,6 +1508,7 @@ th{color:#93c5fd;font-weight:normal}
       <button onclick="savePromo()" style="background:#16a34a">保存并立即生效</button>
     </div>
     <div id="promoHint" class="muted" style="margin-top:6px"></div>
+    <div id="promoRuntime" class="muted" style="margin-top:6px"></div>
   </div>
 
   <div class="card">
@@ -1397,7 +1546,6 @@ th{color:#93c5fd;font-weight:normal}
 <script>
 const TOKEN = new URL(location.href).searchParams.get('token') || '';
 if (!TOKEN) document.body.innerHTML = '<div class="wrap"><h1>缺少 ?token= 参数</h1></div>';
-const NO_VNC_URL = '/vnc.html?autoconnect=true&resize=scale';
 
 async function refreshCaptureStatus(){
   const statusEl = document.getElementById('captureStatus');
@@ -1407,7 +1555,7 @@ async function refreshCaptureStatus(){
     if (r && r.ok && r.active) {
       statusEl.textContent = '运行中，可打开 noVNC';
       statusEl.className = 'ok';
-      link.href = NO_VNC_URL;
+      link.href = '#';
       link.style.display = 'inline-block';
       link.textContent = '打开 noVNC';
     } else {
@@ -1432,7 +1580,7 @@ async function startCapture(btn){
       statusEl.textContent = '已就绪，可打开 noVNC';
       statusEl.className = 'ok';
       const link = document.getElementById('captureLink');
-      link.href = NO_VNC_URL; link.style.display = 'inline-block'; link.textContent = '打开 noVNC';
+      link.href = '#'; link.style.display = 'inline-block'; link.textContent = '打开 noVNC';
     } else {
       statusEl.textContent = '启动失败: ' + (r && (r.detail || (r.health && r.health.err)) || 'unknown');
       statusEl.className = 'bad';
@@ -1555,9 +1703,8 @@ async function loadAccessLinks(){
       <div class="muted">${esc(inst.name)} / token=${esc(inst.token_fingerprint || '-')}</div>
     </div>`;
     const shops = (shopsResp.shops || []).map(s => {
-      const token = s.link_token || TOKEN;
-      const adminUrl = `${(s.admin_url || location.origin).replace(/\/$/,'')}/shop?token=${encodeURIComponent(token)}`;
-      const browserUrl = s.remote_browser_url ? `${s.remote_browser_url}/?token=${encodeURIComponent(token)}` : '#';
+      const adminUrl = s.admin_open_url || '#';
+      const browserUrl = s.browser_open_url || '#';
       return `<div class="stat" style="min-width:300px"><b>${esc(s.name)}</b>
         <div>管理页：<a href="${adminUrl}" target="_blank" style="color:#93c5fd">${esc(adminUrl)}</a></div>
         <div>登录浏览器：<a href="${browserUrl}" target="_blank" style="color:#93c5fd">${esc(browserUrl)}</a></div>
@@ -1602,9 +1749,8 @@ async function loadShops(){
     const r = await api('/api/shops');
     const shops = r.shops || [];
     grid.innerHTML = shops.map(s => {
-      const shopToken = s.link_token || TOKEN;
-      const adminUrl = `${(s.admin_url || location.origin).replace(/\/$/,'')}/shop?token=${encodeURIComponent(shopToken)}`;
-      const browserUrl = s.remote_browser_url ? `${s.remote_browser_url}/?token=${encodeURIComponent(shopToken)}` : '#';
+      const adminUrl = s.admin_open_url || '#';
+      const browserUrl = s.browser_open_url || '#';
       return `<div class="stat" style="min-width:280px">
         <b>${s.name}</b>
         <div>机器人：${unitState(s.bot)}　浏览器：${unitState(s.browser)}</div>
@@ -1748,27 +1894,19 @@ async function svc(action, unit, btn){
 // 打开登录浏览器：先确保服务在跑，再用公网 URL 打开新标签
 async function openRemoteBrowser(ev){
   ev.preventDefault();
-  const a = document.getElementById('openBrowser');
-  // 1) 询问后端当前登录浏览器的公网入口（端口可能受 NAT 映射影响）
-  let url;
   try {
+    const ready = await api('/api/capture/start', {method:'POST'});
+    if (!ready.ok) throw new Error(ready.detail || ready.phase || 'capture start failed');
     const info = await api('/api/remote-browser-url');
-    url = info.url;
+    window.open(info.url, '_blank', 'noopener');
+    setTimeout(refresh, 1500);
   } catch(e) {
-    alert('无法获取登录浏赛器公网地址，请检查 config.yaml 的 remote_browser_public_url');
-    return;
+    alert('登录浏览器启动失败：' + (e.message || e));
   }
-  // 2) 后台异步启动服务（不等结果，避免阻塞新标签）
-  fetch(`/api/service/start?unit=${encodeURIComponent(UNITS.browser)}&token=${encodeURIComponent(TOKEN)}`, {method:'POST'});
-  // 3) 新标签打开
-  window.open(url, '_blank', 'noopener');
-  // 4) 几秒后刷新一下状态卡
-  setTimeout(refresh, 1500);
 }
 // 页面加载时给链接填上默认 href（hover 可见）
-let UNITS = {bot:'meituan-reply-bot.service', browser:'meituan-browser-control.service'};
+let UNITS = {bot:'meituan-reply-bot.service', browser:'meituan-capture-meituan-reply-bot.service'};
 api('/api/units').then(u => { UNITS = u; }).catch(() => {});
-api('/api/remote-browser-url').then(r => { document.getElementById('openBrowser').href = r.url; }).catch(() => {});
 async function loadInstance(){
   const bar = document.getElementById('instanceBar');
   if (!bar) return;
@@ -2038,8 +2176,10 @@ async function loadPromo(){
   try {
     const r = await api('/api/promo-scheduler?token=' + encodeURIComponent(TOKEN));
     document.getElementById('promoEnabled').checked = !!r.enabled;
+    const desiredText = r.desired_now === 'on' ? '应开启' : '应关闭';
     document.getElementById('promoStatus').textContent =
-      r.enabled ? '当前：已启用' : '当前：未启用（保存后调度器将停止动作）';
+      r.enabled ? '当前：已启用，按时间' + desiredText : '当前：未启用（保存后调度器将停止动作）';
+    renderPromoRuntime(r.runtime || {}, r.desired_now);
     const tbody = document.getElementById('promoWindows');
     tbody.innerHTML = '';
     const wins = (r.windows && r.windows.length) ? r.windows : [];
@@ -2048,6 +2188,17 @@ async function loadPromo(){
   } catch(e) {
     document.getElementById('promoHint').innerHTML = '<span class="bad">加载失败：'+esc(e.message)+'</span>';
   }
+}
+function renderPromoRuntime(runtime, desired){
+  const el = document.getElementById('promoRuntime');
+  if (!el) return;
+  if (!runtime.exists) { el.innerHTML = '<span class="warn">暂无调度执行状态，等待下一轮调度写入。</span>'; return; }
+  const actual = runtime.actual ? (runtime.actual === 'on' ? '实际开启' : '实际关闭') : '实际未知';
+  const desiredText = desired === 'on' ? '应开启' : '应关闭';
+  const ok = runtime.ok === false ? 'bad' : 'ok';
+  const msg = runtime.message ? ' / '+esc(runtime.message) : '';
+  const age = typeof runtime.age_seconds === 'number' ? ' / '+Math.floor(runtime.age_seconds/60)+'分钟前' : '';
+  el.innerHTML = `<span class="${ok}">调度状态：${desiredText}，${actual}</span>${age}${msg}`;
 }
 function addPromoRow(w){
   w = w || {start:'09:00', end:'12:00'};

@@ -1,4 +1,4 @@
-﻿name: CI
+name: CI
 
 on:
   push:
@@ -25,6 +25,21 @@ jobs:
           pip install -r shop1/requirements.txt
           pip install -r shop2/requirements.txt || true
 
+      - name: Verify shop implementation parity
+        run: |
+          for file in admin.py auth_ticket.py bot.py browser_common.py cookie_sync.py promo_scheduler.py rules.py state.py; do
+            diff --exit-code shop1/$file shop2/$file
+          done
+          diff --exit-code shop1/capture/cookie_capture.py shop2/capture/cookie_capture.py
+
       - name: Run tests
         run: |
-          python -m pytest -q shop1/test_rules.py shop2/test_rules.py
+          python -m pytest -q \
+            shop1/test_rules.py shop2/test_rules.py \
+            shop1/test_bot_guards.py shop2/test_bot_guards.py \
+            shop1/test_promo_scheduler.py shop2/test_promo_scheduler.py \
+            shop1/test_admin_promo.py shop2/test_admin_promo.py \
+            shop1/test_cookie_capture_auth.py shop2/test_cookie_capture_auth.py \
+            shop1/test_cookie_reload.py shop2/test_cookie_reload.py \
+            shop1/test_cookie_sync_atomic.py shop2/test_cookie_sync_atomic.py \
+            master/test_auth_ticket.py

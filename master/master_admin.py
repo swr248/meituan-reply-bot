@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
+import os
 import subprocess
 import sys
 import time
@@ -11,10 +13,12 @@ from typing import Any, Dict, List
 
 import yaml
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 
-MASTER_TOKEN = "YOUR_MASTER_TOKEN_HERE"
-PUBLIC_HOST = "YOUR_SERVER_IP"
+from auth_ticket import issue_ticket
+
+MASTER_TOKEN = os.environ.get("MASTER_ADMIN_TOKEN", "")
+PUBLIC_HOST = os.environ.get("MEITUAN_PUBLIC_HOST", "")
 
 SHOPS = [
     {
@@ -25,7 +29,7 @@ SHOPS = [
         "browser_external_port": 41171,
         "bot_unit": "meituan-reply-bot.service",
         "admin_unit": "meituan-reply-bot-admin.service",
-        "browser_unit": "meituan-browser-control.service",
+        "browser_unit": "meituan-capture-meituan-reply-bot.service",
     },
     {
         "id": "shop2",
@@ -35,7 +39,7 @@ SHOPS = [
         "browser_external_port": 33941,
         "bot_unit": "meituan-reply-bot-shop2.service",
         "admin_unit": "meituan-reply-bot-admin-shop2.service",
-        "browser_unit": "meituan-browser-control-shop2.service",
+        "browser_unit": "meituan-capture-meituan-reply-bot-shop2.service",
     },
 ]
 
@@ -43,7 +47,9 @@ app = FastAPI(title="美团机器人统一主管理台")
 
 
 def _check_token(token: str) -> None:
-    if not token or token != MASTER_TOKEN:
+    if not MASTER_TOKEN or MASTER_TOKEN == "YOUR_MASTER_TOKEN_HERE":
+        raise HTTPException(503, "master token not configured")
+    if not token or not hmac.compare_digest(token, MASTER_TOKEN):
         raise HTTPException(401, "invalid master token")
 
 
@@ -133,6 +139,31 @@ def _cookie_status(root: Path) -> Dict[str, Any]:
     }
 
 
+def _business_health(root: Path, cfg: Dict[str, Any]) -> Dict[str, Any]:
+    profile_dir = str((cfg.get("browser", {}) or {}).get("profile_dir", "") or "")
+    state_dir = Path(profile_dir).parent / "state" if profile_dir else root / "state"
+    path = state_dir / "last_session.json"
+    try:
+        session = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except Exception as exc:
+        return {"ok": False, "status": "invalid", "path": str(path), "error": str(exc)}
+    timestamp = float(session.get("timestamp", 0) or 0)
+    url = str(session.get("url", "") or "")
+    age = max(0.0, time.time() - timestamp) if timestamp else None
+    lowered = url.lower()
+    if not timestamp:
+        status = "missing"
+    elif "nopermission" in lowered:
+        status = "no_permission"
+    elif any(marker in lowered for marker in ("passport", "login", "signin")):
+        status = "login_required"
+    elif age is not None and age > 120:
+        status = "stale"
+    else:
+        status = "healthy"
+    return {"ok": status == "healthy", "status": status, "url": url, "age_seconds": age, "last_status": session.get("last_status", ""), "path": str(path)}
+
+
 def _meminfo() -> Dict[str, Any]:
     values: Dict[str, int] = {}
     try:
@@ -210,7 +241,6 @@ def _shop_payload(shop: Dict[str, Any]) -> Dict[str, Any]:
         "name": shop["name"],
         "admin_url": f"http://{PUBLIC_HOST}:{shop['admin_external_port']}",
         "browser_url": f"http://{PUBLIC_HOST}:{shop['browser_external_port']}",
-        "token": server.get("auth_token", ""),
         "bot_unit": shop["bot_unit"],
         "admin_unit": shop["admin_unit"],
         "browser_unit": shop["browser_unit"],
@@ -218,10 +248,26 @@ def _shop_payload(shop: Dict[str, Any]) -> Dict[str, Any]:
         "admin": _service_status(shop["admin_unit"]),
         "browser": _service_status(shop["browser_unit"]),
         "cookie": _cookie_status(shop["root"]),
+        "business_health": _business_health(shop["root"], cfg),
         "first_message": replies.get("first_message", ""),
         "fallback": replies.get("fallback", ""),
         "rules": replies.get("rules", []) or [],
     }
+
+
+@app.get("/api/shop/{shop_id}/open/{target}")
+def api_open_shop(shop_id: str, target: str, token: str = Query(...)) -> RedirectResponse:
+    _check_token(token)
+    shop = next((item for item in SHOPS if item["id"] == shop_id), None)
+    if not shop or target not in ("admin", "browser"):
+        raise HTTPException(404, "shop target not found")
+    cfg = _load_shop_config(shop["root"])
+    secret = str((cfg.get("server", {}) or {}).get("auth_token", "") or "")
+    if not secret:
+        raise HTTPException(500, "shop auth token not configured")
+    ticket = issue_ticket(secret, shop_id, target, ttl=60)
+    port = shop["admin_external_port"] if target == "admin" else shop["browser_external_port"]
+    return RedirectResponse(f"http://{PUBLIC_HOST}:{port}/auth/exchange?ticket={ticket}", status_code=302)
 
 
 @app.get("/api/overview")
@@ -232,6 +278,8 @@ def api_overview(token: str = Query(...)) -> Dict[str, Any]:
     for shop in shops:
         if not shop["bot"]["active"]:
             alerts.append(f"{shop['name']} 机器人离线")
+        elif not shop["business_health"]["ok"]:
+            alerts.append(f"{shop['name']} 业务异常：{shop['business_health']['status']}")
         if shop["cookie"]["status"] in ("none", "expired"):
             alerts.append(f"{shop['name']} Cookie 需要重新导出")
     return {
@@ -268,10 +316,13 @@ def api_cleanup_deep(token: str = Query(...)) -> Dict[str, Any]:
     before = _meminfo()
     steps = []
     browser_units = [shop["browser_unit"] for shop in SHOPS]
+    active_browsers = [unit for unit in browser_units if _service_status(unit)["active"]]
+    if active_browsers:
+        raise HTTPException(409, "stop active noVNC sessions from the shop admin before deep cleanup")
     bot_units = [shop["bot_unit"] for shop in SHOPS]
     admin_units = [shop["admin_unit"] for shop in SHOPS]
 
-    for unit in browser_units + bot_units:
+    for unit in bot_units:
         steps.append({"step": f"stop {unit}", **_run(["sudo", "-n", "systemctl", "stop", unit], timeout=30)})
     steps.append({"step": "drop caches", **_run(["sudo", "-n", "/usr/local/sbin/meituan-drop-caches"], timeout=20)})
     for unit in admin_units + bot_units:
@@ -291,6 +342,8 @@ def api_service_action(shop_id: str, unit: str, action: str, token: str = Query(
         raise HTTPException(400, "bad action")
     if unit not in {shop["bot_unit"], shop["admin_unit"], shop["browser_unit"]}:
         raise HTTPException(400, "bad unit")
+    if unit == shop["browser_unit"]:
+        raise HTTPException(409, "capture must be controlled from the shop admin")
 
     result = _run(["sudo", "-n", "systemctl", action, unit], timeout=20)
     return result
@@ -318,8 +371,8 @@ function logsHtml(logs){logs=logs||{};return `<div class="card"><h3>\u8fd0\u884c
 function saveLogScroll(){const pos={};document.querySelectorAll('.logbox[data-log]').forEach(el=>{pos[el.dataset.log]=el.scrollTop});return pos}
 function restoreLogScroll(pos){if(!pos)return;document.querySelectorAll('.logbox[data-log]').forEach(el=>{if(Object.prototype.hasOwnProperty.call(pos,el.dataset.log))el.scrollTop=pos[el.dataset.log]})}
 function renderNav(){let html=`<button class="nav-item ${current==='overview'?'active':''}" data-view="overview"><span class="nav-title"><span>概览</span><span class="tag">总览</span></span></button>`;(overview?.shops||[]).forEach(s=>{let cls=s.bot.active?'ok':s.admin.active?'warn':'bad';html+=`<button class="nav-item ${current===s.id?'active':''}" data-view="${s.id}"><span class="nav-title"><span>${esc(s.name)}</span><span class="tag ${cls}">${s.bot.active?'在线':'离线'}</span></span></button>`});$('nav').innerHTML=html}
-function renderOverview(){const logPos=saveLogScroll();current='overview';renderNav();$('title').textContent='概览';$('subtitle').textContent='服务器、店铺、Cookie、清理与运行日志';$('timeTag').textContent=overview.time||'--';const m=overview.memory||{};const alerts=overview.alerts||[];$('content').innerHTML=`<div class="grid"><div class="card third"><h3>服务器内存</h3><div class="metric"><strong>${m.used_percent??0}%</strong><span>已使用</span></div><div class="progress"><div class="bar" style="width:${m.used_percent??0}%"></div></div><div class="row" style="margin-top:12px"><span>可用</span><b>${m.available_gb??0} GB</b></div><div class="row"><span>缓存</span><b>${m.cached_gb??0} GB</b></div><div class="actions" style="margin-top:16px"><button class="btn secondary" onclick="cleanup('light')">不影响 Bot 清理</button><button class="btn danger" onclick="cleanup('deep')">影响 Bot 大清理</button></div></div><div class="card third"><h3>运行时长</h3><div class="metric"><strong>${esc(overview.uptime||'未知')}</strong></div><div class="muted" style="margin-top:12px">系统时间：${esc(overview.time||'--')}</div></div><div class="card third"><h3>报警</h3>${alerts.length?alerts.map(a=>`<div class="row"><b class="bad">${esc(a)}</b></div>`).join(''):'<div class="metric"><strong class="ok">正常</strong><span>暂无报警</span></div>'}</div><div class="card"><h3>店铺总览</h3><div class="grid">${(overview.shops||[]).map(s=>`<div class="card half" style="margin:0"><h3>${esc(s.name)}</h3><div class="rows"><div class="row"><span>机器人</span><b>${stateTag(s.bot.active)}</b></div><div class="row"><span>管理端</span><b>${stateTag(s.admin.active)}</b></div><div class="row"><span>登录浏览器</span><b>${stateTag(s.browser.active)}</b></div><div class="row"><span>Cookie</span><b>${cookie(s.cookie)}</b></div></div><div class="actions" style="margin-top:16px"><button class="btn" onclick="openShop('${s.id}')">查看详情</button><a class="btn secondary" target="_blank" href="${s.admin_url}/?token=${encodeURIComponent(s.token)}">分管理页</a><a class="btn secondary" target="_blank" href="${s.browser_url}/?token=${encodeURIComponent(s.token)}">登录浏览器</a></div></div>`).join('')}</div></div>${logsHtml(overview.logs)}</div>`;restoreLogScroll(logPos)}
-async function renderShop(id){current=id;renderNav();const s=await api(`/api/shop/${id}`);$('title').textContent=s.name;$('subtitle').textContent='店铺运行状态、服务控制和回复规则';$('content').innerHTML=`<div class="grid"><div class="card third"><h3>机器人</h3>${stateTag(s.bot.active)}<div class="muted" style="margin-top:10px">PID：${esc(s.bot.raw.MainPID||'-')}</div></div><div class="card third"><h3>管理端</h3>${stateTag(s.admin.active)}<div class="muted" style="margin-top:10px">PID：${esc(s.admin.raw.MainPID||'-')}</div></div><div class="card third"><h3>Cookie</h3>${cookie(s.cookie)}<div class="muted" style="margin-top:10px">数量：${s.cookie.cookie_count||0} 个<br>导出：${esc(s.cookie.exported_at||'-')}</div></div><div class="card"><h3>服务控制</h3><div class="actions"><button class="btn" onclick="svc('${s.id}','${s.bot_unit}','start')">启动机器人</button><button class="btn danger" onclick="svc('${s.id}','${s.bot_unit}','stop')">停止机器人</button><button class="btn secondary" onclick="svc('${s.id}','${s.bot_unit}','restart')">重启机器人</button><a class="btn secondary" target="_blank" href="${s.admin_url}/?token=${encodeURIComponent(s.token)}">打开分管理页</a><a class="btn secondary" target="_blank" href="${s.browser_url}/?token=${encodeURIComponent(s.token)}">打开登录浏览器</a></div></div><div class="card"><h3>回复策略</h3><div class="rows"><div class="row"><span>首条欢迎</span><b>${esc(s.first_message||'-')}</b></div><div class="row"><span>保底回复</span><b>${esc(s.fallback||'-')}</b></div></div><table class="table"><thead><tr><th>规则</th><th>关键词</th><th>回复内容</th></tr></thead><tbody>${(s.rules||[]).map(r=>`<tr><td>${esc(r.name||'-')}</td><td>${esc((r.keywords||[]).join('、'))}</td><td>${esc(r.reply||'-')}</td></tr>`).join('')}</tbody></table></div></div>`}
+function renderOverview(){const logPos=saveLogScroll();current='overview';renderNav();$('title').textContent='概览';$('subtitle').textContent='服务器、店铺、Cookie、清理与运行日志';$('timeTag').textContent=overview.time||'--';const m=overview.memory||{};const alerts=overview.alerts||[];$('content').innerHTML=`<div class="grid"><div class="card third"><h3>服务器内存</h3><div class="metric"><strong>${m.used_percent??0}%</strong><span>已使用</span></div><div class="progress"><div class="bar" style="width:${m.used_percent??0}%"></div></div><div class="row" style="margin-top:12px"><span>可用</span><b>${m.available_gb??0} GB</b></div><div class="row"><span>缓存</span><b>${m.cached_gb??0} GB</b></div><div class="actions" style="margin-top:16px"><button class="btn secondary" onclick="cleanup('light')">不影响 Bot 清理</button><button class="btn danger" onclick="cleanup('deep')">影响 Bot 大清理</button></div></div><div class="card third"><h3>运行时长</h3><div class="metric"><strong>${esc(overview.uptime||'未知')}</strong></div><div class="muted" style="margin-top:12px">系统时间：${esc(overview.time||'--')}</div></div><div class="card third"><h3>报警</h3>${alerts.length?alerts.map(a=>`<div class="row"><b class="bad">${esc(a)}</b></div>`).join(''):'<div class="metric"><strong class="ok">正常</strong><span>暂无报警</span></div>'}</div><div class="card"><h3>店铺总览</h3><div class="grid">${(overview.shops||[]).map(s=>`<div class="card half" style="margin:0"><h3>${esc(s.name)}</h3><div class="rows"><div class="row"><span>机器人</span><b>${stateTag(s.bot.active)}</b></div><div class="row"><span>管理端</span><b>${stateTag(s.admin.active)}</b></div><div class="row"><span>登录浏览器</span><b>${stateTag(s.browser.active)}</b></div><div class="row"><span>Cookie</span><b>${cookie(s.cookie)}</b></div></div><div class="actions" style="margin-top:16px"><button class="btn" onclick="openShop('${s.id}')">查看详情</button><a class="btn secondary" target="_blank" href="${location.origin}/api/shop/${s.id}/open/admin?token=${encodeURIComponent(TOKEN)}">分管理页</a><a class="btn secondary" target="_blank" href="${location.origin}/api/shop/${s.id}/open/browser?token=${encodeURIComponent(TOKEN)}">登录浏览器</a></div></div>`).join('')}</div></div>${logsHtml(overview.logs)}</div>`;restoreLogScroll(logPos)}
+async function renderShop(id){current=id;renderNav();const s=await api(`/api/shop/${id}`);$('title').textContent=s.name;$('subtitle').textContent='店铺运行状态、服务控制和回复规则';$('content').innerHTML=`<div class="grid"><div class="card third"><h3>机器人</h3>${stateTag(s.bot.active)}<div class="muted" style="margin-top:10px">PID：${esc(s.bot.raw.MainPID||'-')}</div></div><div class="card third"><h3>管理端</h3>${stateTag(s.admin.active)}<div class="muted" style="margin-top:10px">PID：${esc(s.admin.raw.MainPID||'-')}</div></div><div class="card third"><h3>Cookie</h3>${cookie(s.cookie)}<div class="muted" style="margin-top:10px">数量：${s.cookie.cookie_count||0} 个<br>导出：${esc(s.cookie.exported_at||'-')}</div></div><div class="card"><h3>服务控制</h3><div class="actions"><button class="btn" onclick="svc('${s.id}','${s.bot_unit}','start')">启动机器人</button><button class="btn danger" onclick="svc('${s.id}','${s.bot_unit}','stop')">停止机器人</button><button class="btn secondary" onclick="svc('${s.id}','${s.bot_unit}','restart')">重启机器人</button><a class="btn secondary" target="_blank" href="${location.origin}/api/shop/${s.id}/open/admin?token=${encodeURIComponent(TOKEN)}">打开分管理页</a><a class="btn secondary" target="_blank" href="${location.origin}/api/shop/${s.id}/open/browser?token=${encodeURIComponent(TOKEN)}">打开登录浏览器</a></div></div><div class="card"><h3>回复策略</h3><div class="rows"><div class="row"><span>首条欢迎</span><b>${esc(s.first_message||'-')}</b></div><div class="row"><span>保底回复</span><b>${esc(s.fallback||'-')}</b></div></div><table class="table"><thead><tr><th>规则</th><th>关键词</th><th>回复内容</th></tr></thead><tbody>${(s.rules||[]).map(r=>`<tr><td>${esc(r.name||'-')}</td><td>${esc((r.keywords||[]).join('、'))}</td><td>${esc(r.reply||'-')}</td></tr>`).join('')}</tbody></table></div></div>`}
 function openShop(id){renderShop(id).catch(showError)}async function svc(shopId,unit,action){const r=await api(`/api/shop/${shopId}/service/${encodeURIComponent(unit)}/${action}`,{method:'POST'});alert(r.ok?'操作成功':'操作失败：'+(r.stderr||r.stdout||''));await refresh();if(current!=='overview')await renderShop(current)}async function cleanup(mode){if(mode==='deep'&&!confirm('影响 Bot 大清理会停止 bot/browser，再清理缓存并重新启动 bot。确定执行吗？'))return;const label=mode==='deep'?'影响 Bot 大清理':'不影响 Bot 清理';const r=await api(`/api/cleanup/${mode}`,{method:'POST'});alert(`${label}${r.ok?'完成':'失败'}\n清理前可用内存：${r.before?.available_gb??'-'} GB\n清理后可用内存：${r.after?.available_gb??'-'} GB`);await refresh()}function showError(e){$('content').innerHTML=`<div class="card"><h3 class="bad">加载失败</h3><div class="muted">${esc(e.message)}</div></div>`}
 $('nav').addEventListener('click',e=>{const b=e.target.closest('.nav-item');if(!b)return;b.dataset.view==='overview'?renderOverview():openShop(b.dataset.view)});async function refresh(){overview=await api('/api/overview');renderNav();if(current==='overview')renderOverview()}refresh().catch(showError);setInterval(()=>refresh().catch(()=>{}),10000);
 </script>
@@ -340,7 +393,7 @@ def main() -> int:
     args = parser.parse_args()
     import uvicorn
 
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info", access_log=False)
     return 0
 
 

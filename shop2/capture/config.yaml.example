@@ -1,0 +1,17 @@
+meituan:
+  login_url: https://shangoue.meituan.com/
+  chat_url: https://shangoue.meituan.com/imworkbench/home
+server:
+  remote_browser_host: 0.0.0.0
+  remote_browser_port: 5902
+  auth_token: YOUR_SHOP2_TOKEN_HERE
+  remote_browser_public_url: http://YOUR_SERVER_IP:33941/
+browser:
+  headless: false
+  viewport:
+    width: 1440
+    height: 900
+  launch_args:
+    - --no-sandbox
+    - --disable-dev-shm-usage
+    - --disable-blink-features=AutomationControlled

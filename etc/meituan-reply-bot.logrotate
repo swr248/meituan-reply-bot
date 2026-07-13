@@ -1,0 +1,14 @@
+/home/ubuntu/meituan-reply-bot/logs/*.log
+/home/ubuntu/meituan-reply-bot-shop2/logs/*.log {
+    daily
+    rotate 7
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    dateext
+    dateformat -%Y%m%d
+    maxsize 20M
+    su ubuntu ubuntu
+}

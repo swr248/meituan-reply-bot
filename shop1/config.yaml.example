@@ -7,6 +7,7 @@ server:
   admin_port: 3003
   remote_browser_host: 0.0.0.0
   remote_browser_port: 5901
+  capture_port: 5901
   auth_token: YOUR_SHOP1_TOKEN_HERE
   remote_browser_public_url: http://YOUR_SERVER_IP:41171/
   legacy_auth_tokens:
@@ -59,6 +60,7 @@ replies:
 promotion_scheduler:
   enabled: false
   check_interval_sec: 30
+  reconcile_interval_sec: 3600
   target_url: "https://waimaieapp.meituan.com/ad/v1/rpc?&#/subapp/isomor_sg_onestop/pages/onestop/index"
   switch_selector: ".sg-onestop-header-switch"
   windows:

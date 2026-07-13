@@ -3,6 +3,7 @@ Description=Meituan reply bot admin (shop2)
 After=network-online.target
 Wants=network-online.target
 [Service]
+Slice=meituan.slice
 Environment=TZ=Asia/Shanghai
 Type=simple
 User=ubuntu

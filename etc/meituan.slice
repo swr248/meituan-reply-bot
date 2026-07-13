@@ -1,0 +1,7 @@
+[Unit]
+Description=Meituan application memory budget
+
+[Slice]
+MemoryAccounting=yes
+MemoryHigh=2200M
+MemoryMax=2700M

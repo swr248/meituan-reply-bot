@@ -7,13 +7,15 @@ server:
   admin_port: 3004
   remote_browser_host: 0.0.0.0
   remote_browser_port: 5902
+  capture_port: 5902
+  instance_suffix: -shop2
   auth_token: YOUR_SHOP2_TOKEN_HERE
-  remote_browser_public_url: http://YOUR_SERVER_IP:41171/
+  remote_browser_public_url: http://YOUR_SERVER_IP:33941/
   legacy_auth_tokens:
   - YOUR_LEGACY_TOKEN_HERE
 browser:
   headless: true
-  profile_dir: /home/ubuntu/.meituan-reply-bot/browser-profile
+  profile_dir: /home/ubuntu/.meituan-reply-bot-shop2/browser-profile
   viewport:
     width: 1440
     height: 900
@@ -59,6 +61,7 @@ replies:
 promotion_scheduler:
   enabled: false
   check_interval_sec: 30
+  reconcile_interval_sec: 3600
   target_url: "https://waimaieapp.meituan.com/ad/v1/rpc?&#/subapp/isomor_sg_onestop/pages/onestop/index"
   switch_selector: ".sg-onestop-header-switch"
   windows:

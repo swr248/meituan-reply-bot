@@ -6,6 +6,7 @@ StartLimitIntervalSec=300
 StartLimitBurst=5
 
 [Service]
+Slice=meituan.slice
 Environment=TZ=Asia/Shanghai
 Type=simple
 User=ubuntu
@@ -15,7 +16,8 @@ ExecStart=/home/ubuntu/meituan-reply-bot/run.sh
 Restart=always
 RestartSec=10
 MemoryAccounting=yes
-MemoryMax=2200M
+MemoryMax=1500M
+MemoryHigh=1200M
 
 [Install]
 WantedBy=multi-user.target

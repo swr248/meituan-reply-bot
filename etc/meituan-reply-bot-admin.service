@@ -6,6 +6,7 @@ StartLimitIntervalSec=300
 StartLimitBurst=5
 
 [Service]
+Slice=meituan.slice
 Environment=TZ=Asia/Shanghai
 Type=simple
 User=ubuntu

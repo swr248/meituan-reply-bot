@@ -4,6 +4,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+Slice=meituan.slice
 Type=simple
 WorkingDirectory=/home/ubuntu/meituan-reply-bot-shop2
 ExecStart=/home/ubuntu/meituan-reply-bot-shop2/.venv/bin/python -u /home/ubuntu/meituan-reply-bot-shop2/promo_scheduler.py --config /home/ubuntu/meituan-reply-bot-shop2/config.yaml
