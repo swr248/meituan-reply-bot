@@ -70,6 +70,19 @@ def parse_countdown(text: str) -> Optional[int]:
     return val
 
 
+def inbound_message_fingerprint(text: str, bubble_index: int, peer_total: int) -> str:
+    import hashlib
+
+    source = f"{(text or '').strip()}|{bubble_index}|{peer_total}"
+    return hashlib.md5(source.encode("utf-8")).hexdigest()[:12]
+
+
+def should_rebuild_browser(idle_rounds: int, last_rebuild_ts: float, now_ts: float, idle_minutes: int, idle_round_limit: int) -> bool:
+    if idle_minutes <= 0 or idle_round_limit <= 0:
+        return False
+    return idle_rounds >= idle_round_limit and (now_ts - last_rebuild_ts) >= idle_minutes * 60
+
+
 
 SELF_AI_PHRASES = (
     "\u60a8\u597d\uff0c\u8bf7\u95ee\u6709\u4ec0\u4e48\u53ef\u4ee5\u5e2e\u5230\u60a8",  # \u60a8\u597d\uff0c\u8bf7\u95ee\u6709\u4ec0\u4e48\u53ef\u4ee5\u5e2e\u5230\u60a8
@@ -152,7 +165,7 @@ class MeituanBot:
         self._stop = False
         self.last_cool = 0.0
         self._diag_last_ts: Dict[str, float] = {}
-        self._last_page_reload_ts: float = 0.0
+        self._last_browser_rebuild_ts: float = time.time()
         self._idle_rounds: int = 0
         self._last_session_file = Path(cfg["browser"]["profile_dir"]).parent / "state" / "last_session.json"
         self._browser = None
@@ -172,8 +185,10 @@ class MeituanBot:
         try:
             self._last_session_file.parent.mkdir(parents=True, exist_ok=True)
             data = {"timestamp": time.time(), **fields}
-            with self._last_session_file.open("w", encoding="utf-8") as f:
+            temp_path = self._last_session_file.with_suffix(".json.tmp")
+            with temp_path.open("w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
+            temp_path.replace(self._last_session_file)
         except Exception as e:
             log.debug("save session failed: %s", e)
 
@@ -258,6 +273,7 @@ class MeituanBot:
             self._dump_dom_diagnostics(self._page, tag="post-rebuild")
             self._diag_last_ts.clear()
             self._idle_rounds = 0
+            self._last_browser_rebuild_ts = time.time()
             try:
                 self._current_cookie_mtime = cookie_file_path(self.cfg).stat().st_mtime
             except Exception:
@@ -269,6 +285,28 @@ class MeituanBot:
                 os._exit(2)
             log.error("rebuild failed: %s", e)
             return None
+
+    def _reload_cookie_context(self, new_mtime: float) -> Page:
+        cookies = load_cookies(self.cfg)
+        if not cookies:
+            raise RuntimeError("updated cookie file contains no cookies")
+        candidate = self._browser.new_context(viewport=self._viewport)
+        try:
+            candidate.add_cookies(cookies)
+            candidate_page = candidate.new_page()
+            self._bootstrap(candidate_page)
+            if not url_is_correct(candidate_page, self.cfg):
+                raise RuntimeError(f"updated cookies did not reach workbench: {candidate_page.url}")
+        except Exception:
+            candidate.close()
+            raise
+        old_context = self._context
+        self._context = candidate
+        self._page = candidate_page
+        self._current_cookie_mtime = new_mtime
+        old_context.close()
+        log.info("committed %d updated cookies after candidate validation", len(cookies))
+        return candidate_page
 
     def _loop(self, p: Playwright) -> None:
         # Use launch() + new_context() + add_cookies() instead of persistent context
@@ -293,6 +331,7 @@ class MeituanBot:
             self._page = self._context.new_page()
             self._bootstrap(self._page)
             self._dump_dom_diagnostics(self._page, tag="post-bootstrap")
+            self._last_browser_rebuild_ts = time.time()
             log.warning("[loop] entering main loop")
             page = self._page  # local alias for backward compat
             poll = max(1, int(self.monitor.get("poll_seconds", 2)))
@@ -312,6 +351,9 @@ class MeituanBot:
                     scan_counter += 1
                     try:
                         log.info("[loop] iter=%d url=%s", scan_counter, page.url[:80])
+                        current_url = page.url or ""
+                        status = "no_permission" if "nopermission" in current_url.lower() else ("workbench" if url_is_correct(page, self.cfg) else "redirected")
+                        self._save_session(url=current_url, last_status=status, scan_counter=scan_counter)
                     except Exception as e:
                         log.warning("page.url read failed: %s", e)
                         new_page = self._rebuild_browser(p, reason="url-read-failed")
@@ -327,19 +369,8 @@ class MeituanBot:
                             cookie_path = cookie_file_path(self.cfg)
                             new_mtime = cookie_path.stat().st_mtime if cookie_path.exists() else 0.0
                             if new_mtime and new_mtime > self._current_cookie_mtime:
-                                log.info("cookie file updated; rebuilding bot context only")
-                                try:
-                                    self._context.close()
-                                except Exception:
-                                    pass
-                                self._context = self._browser.new_context(viewport=self._viewport)
-                                cookies = load_cookies(self.cfg)
-                                if cookies:
-                                    self._context.add_cookies(cookies)
-                                    self._current_cookie_mtime = new_mtime
-                                    log.info("re-injected %d updated cookies", len(cookies))
-                                self._page = self._context.new_page()
-                                self._bootstrap(self._page)
+                                log.info("cookie file updated; validating candidate context")
+                                self._page = self._reload_cookie_context(new_mtime)
                                 self._dump_dom_diagnostics(self._page, tag="post-cookie-reload")
                                 page = self._page
                                 continue
@@ -379,28 +410,22 @@ class MeituanBot:
                                 continue
                         self.last_self_check = time.time()
                     did_work = self._scan_once(page)
-                    # 空闲检测：连续多轮无候选 + 距上次刷新超过配置阈值，自动 reload 释放页面内存
+                    # 空闲检测：连续无候选后完整重建浏览器，释放 Chromium/Playwright 长期累积内存。
                     if did_work:
                         self._idle_rounds = 0
                     else:
                         self._idle_rounds += 1
-                    idle_min = int(self.monitor.get("page_reload_idle_minutes", 180))
+                    idle_min = int(self.monitor.get("browser_rebuild_idle_minutes", self.monitor.get("page_reload_idle_minutes", 180)))
                     idle_min_rounds = int(self.monitor.get("page_reload_idle_rounds", 100))
-                    if self._idle_rounds >= idle_min_rounds and (time.time() - self._last_page_reload_ts) > idle_min * 60:
-                        log.info("page idle reload triggered: idle_rounds=%d minutes_idle=%.0f", self._idle_rounds, (time.time() - self._last_page_reload_ts) / 60)
-                        try:
-                            page.reload(wait_until="domcontentloaded", timeout=30000)
-                            self._last_page_reload_ts = time.time()
-                            self._idle_rounds = 0
-                            self._diag_last_ts.clear()
-                            time.sleep(self.monitor.get("warmup_seconds", 5))
-                        except Exception as e:
-                            log.warning("page idle reload failed: %s; rebuilding browser stack", e)
-                            new_page = self._rebuild_browser(p, reason="page-reload-failed")
-                            if new_page is None:
-                                time.sleep(5)
-                                continue
-                            page = new_page
+                    now_ts = time.time()
+                    if should_rebuild_browser(self._idle_rounds, self._last_browser_rebuild_ts, now_ts, idle_min, idle_min_rounds):
+                        log.info("browser idle rebuild triggered: idle_rounds=%d minutes_idle=%.0f", self._idle_rounds, (now_ts - self._last_browser_rebuild_ts) / 60)
+                        new_page = self._rebuild_browser(p, reason="idle-rebuild")
+                        if new_page is None:
+                            time.sleep(5)
+                            continue
+                        page = new_page
+                        time.sleep(self.monitor.get("warmup_seconds", 5))
                 except Exception as e:
                     log.exception("scan error: %s", e)
                     self_check_counter += 1
@@ -485,7 +510,8 @@ class MeituanBot:
     def _self_check(self, page: Page) -> None:
         try:
             cur = page.url or ""
-            self._save_session(url=cur, last_status="alive")
+            status = "no_permission" if "nopermission" in cur.lower() else ("workbench" if url_is_correct(page, self.cfg) else "redirected")
+            self._save_session(url=cur, last_status=status)
             if url_is_bad(page, self.cfg):
                 log.warning("self_check: on bad page url=%s", cur)
                 navigate_chat_url(page, self.cfg, log_prefix="[self-check] ")
@@ -801,8 +827,7 @@ class MeituanBot:
         if is_self_ai_reply(card_text):
             log.info("self-ai preview present but card pending - continue customer=%s text=%r", customer, card_text[:120])
 
-        import hashlib as _hashlib
-        peer_fp = _hashlib.md5(((last_text or "").strip()).encode("utf-8")).hexdigest()[:12]
+        peer_fp = inbound_message_fingerprint(last_text, peer_idx, peer_total)
         wm_key = f"last_peer_fp:{session_key}"
         last_fp = ""
         last_fp_age = 9999.0
@@ -831,10 +856,10 @@ class MeituanBot:
             # No countdown/timeout but same bubble - skip to avoid loop
             log.info("watermark skip same visual bubble customer=%s fp=%s age=%.1fs", customer, peer_fp, last_fp_age)
             return
-        # Per-session reply count limit: default 3 replies per session.
-        # Prevents infinite loop when the same bubble keeps being detected as pending.
+        # Limit retries for one concrete customer bubble, not the whole customer/session.
+        # A new bubble gets a new fingerprint even when the customer repeats the same text.
         MAX_REPLIES = 3
-        reply_count_key = f"reply_count:{session_key}"
+        reply_count_key = f"reply_count:{session_key}:{peer_fp}"
         reply_count = 0
         try:
             rc_raw = self.state.get_value(reply_count_key)
@@ -842,7 +867,7 @@ class MeituanBot:
         except Exception:
             reply_count = 0
         if reply_count >= MAX_REPLIES:
-            log.info("reply limit reached (%d/%d) customer=%s - skip", reply_count, MAX_REPLIES, customer)
+            log.info("message retry limit reached (%d/%d) customer=%s fp=%s - skip", reply_count, MAX_REPLIES, customer, peer_fp)
             return
 
         decision = decide_reply(last_text, self.cfg, is_first_message=False)

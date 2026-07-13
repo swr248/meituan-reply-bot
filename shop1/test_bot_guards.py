@@ -7,7 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from bot import parse_countdown  # noqa: E402
+from bot import inbound_message_fingerprint, parse_countdown, should_rebuild_browser  # noqa: E402
 from state import ReplyState  # noqa: E402
 
 CFG_URL = {
@@ -22,6 +22,7 @@ def t(name, fn):
         print(f"PASS  {name}")
     except AssertionError as e:
         print(f"FAIL  {name}: {e}")
+        raise
 
 
 def test_countdown_s():
@@ -45,9 +46,15 @@ def test_garbage():
     assert parse_countdown("hello world") is None
 
 
+def test_idle_browser_rebuild_thresholds():
+    assert should_rebuild_browser(100, 0, 10800, 180, 100)
+    assert not should_rebuild_browser(99, 0, 10800, 180, 100)
+    assert not should_rebuild_browser(100, 0, 10799, 180, 100)
+
+
 def test_state_distinguishes_same_text():
     """连续两条相同文本应该被区分（不同 index/total）。"""
-    import tempfile, os
+    import tempfile
     with tempfile.TemporaryDirectory() as d:
         st = ReplyState(d)
         k1 = st.make_key("alice", "你好", 5, 6)
@@ -58,9 +65,19 @@ def test_state_distinguishes_same_text():
         assert not st.already_replied(k2), "第二条相同文本应被视为新消息"
 
 
+def test_inbound_fingerprint_tracks_message_instance():
+    first = inbound_message_fingerprint("v**\n你好", 5, 4)
+    same_scan = inbound_message_fingerprint("v**\n你好", 5, 4)
+    repeated_text_new_bubble = inbound_message_fingerprint("v**\n你好", 6, 5)
+    assert first == same_scan
+    assert first != repeated_text_new_bubble
+
+
 if __name__ == "__main__":
     t("countdown_s", test_countdown_s)
     t("countdown_zh", test_countdown_zh)
     t("clock_not_countdown", test_clock_not_countdown)
     t("garbage", test_garbage)
+    t("idle_browser_rebuild_thresholds", test_idle_browser_rebuild_thresholds)
     t("state_distinguishes_same_text", test_state_distinguishes_same_text)
+    t("inbound_fingerprint_tracks_message_instance", test_inbound_fingerprint_tracks_message_instance)
