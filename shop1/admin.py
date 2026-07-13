@@ -96,7 +96,7 @@ def _public_admin_url(server: Dict[str, Any]) -> str:
     browser_url = str(server.get("remote_browser_public_url", "") or "")
     parsed = urlparse(browser_url)
     scheme = parsed.scheme or "http"
-    host = parsed.hostname or "103.236.96.82"
+    host = parsed.hostname or "CHANGE_ME_TO_PUBLIC_IP"
     return f"{scheme}://{host}:{public_port}"
 
 app = FastAPI(title="美团外卖自动回复机器人 管理台")
