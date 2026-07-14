@@ -35,6 +35,11 @@ class BusinessHealthTests(unittest.TestCase):
         self.assertEqual(health['status'], 'healthy')
         self.assertTrue(health['ok'])
 
+    def test_scan_mismatch_is_not_healthy(self):
+        health = admin._classify_business_health({'timestamp': 1000, 'url': 'https://x/imworkbench/home', 'scan_status': 'mismatch'}, 1050)
+        self.assertEqual(health['status'], 'scan_mismatch')
+        self.assertFalse(health['ok'])
+
 
 class CaptureOwnershipTests(unittest.TestCase):
     def test_start_rejects_when_scheduler_owns_global_lock(self):

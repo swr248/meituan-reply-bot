@@ -256,6 +256,8 @@ def _classify_business_health(session: Dict[str, Any], now: Optional[float] = No
         status = "no_permission"
     elif any(marker in lowered for marker in ("passport", "login", "signin")):
         status = "login_required"
+    elif session.get("scan_status") == "mismatch":
+        status = "scan_mismatch"
     elif age is not None and age > 120:
         status = "stale"
     else:

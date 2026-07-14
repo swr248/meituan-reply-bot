@@ -7,7 +7,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from bot import inbound_message_fingerprint, parse_countdown, should_rebuild_browser  # noqa: E402
+from bot import (  # noqa: E402
+    MeituanBot,
+    conversation_card_is_candidate,
+    inbound_message_fingerprint,
+    parse_countdown,
+    should_rebuild_browser,
+)
 from state import ReplyState  # noqa: E402
 
 CFG_URL = {
@@ -73,6 +79,16 @@ def test_inbound_fingerprint_tracks_message_instance():
     assert first != repeated_text_new_bubble
 
 
+def test_order_card_with_timeout_is_candidate():
+    card_text = "\u4eca\u65e5#16\u5355\n\u54ce**\n17:05\n\u66f4\u6539\u5730\u5740\n\u8d85\u65f6\u672a\u56de\u590d"
+    assert conversation_card_is_candidate(card_text)
+
+
+def test_today_order_card_extracts_masked_customer():
+    card_text = "\u5f85\u56de\u590d 1\n\u4eca\u65e5#16\u5355 \u54ce**\n17:05\n\u66f4\u6539\u5730\u5740\n\u8d85\u65f6\u672a\u56de\u590d"
+    assert MeituanBot._extract_name_from_text(card_text) == "\u54ce**"
+
+
 if __name__ == "__main__":
     t("countdown_s", test_countdown_s)
     t("countdown_zh", test_countdown_zh)
@@ -81,3 +97,5 @@ if __name__ == "__main__":
     t("idle_browser_rebuild_thresholds", test_idle_browser_rebuild_thresholds)
     t("state_distinguishes_same_text", test_state_distinguishes_same_text)
     t("inbound_fingerprint_tracks_message_instance", test_inbound_fingerprint_tracks_message_instance)
+    t("order_card_with_timeout_is_candidate", test_order_card_with_timeout_is_candidate)
+    t("today_order_card_extracts_masked_customer", test_today_order_card_extracts_masked_customer)

@@ -143,6 +143,23 @@ def card_has_pending_signal(text: str) -> bool:
         return False
     return True
 
+
+def conversation_card_is_candidate(text: str) -> bool:
+    """Return True when text has the shape of a conversation card."""
+    card_text = (text or "").strip()
+    if not card_text or len(card_text) > 180:
+        return False
+    if any(token in card_text for token in ("已经到底了", "暂无消息", "加载中")):
+        return False
+    lines = [line.strip() for line in card_text.split("\n") if line.strip()]
+    if not 3 <= len(lines) <= 6:
+        return False
+    has_order = "已下" in card_text or ORDER_SESSION_RE.search(card_text) is not None
+    has_time = re.search(r"\d{1,2}:\d{2}", card_text) is not None
+    has_status = any(keyword in card_text for keyword in ("机器人", "客服", "推荐商品", "接待中"))
+    return has_order or (has_status and has_time) or (card_has_pending_signal(card_text) and has_time)
+
+
 # 选择器集合（实际部署时需要根据美团 IM 真实 DOM 调整）
 CONVERSATION_LIST_SEL = "[class*='conversation'], [class*='session-list']"
 CONVERSATION_ITEM_SEL = "[class*='conversation-item'], [class*='session-item']"
@@ -176,6 +193,7 @@ class MeituanBot:
         self._headless = True
         self._current_cookie_mtime = 0.0
         self._restart_cooldown_until = 0.0
+        self._scan_status = "unknown"
 
     def request_stop(self, *_) -> None:
         log.info("stop signal received")
@@ -353,7 +371,7 @@ class MeituanBot:
                         log.info("[loop] iter=%d url=%s", scan_counter, page.url[:80])
                         current_url = page.url or ""
                         status = "no_permission" if "nopermission" in current_url.lower() else ("workbench" if url_is_correct(page, self.cfg) else "redirected")
-                        self._save_session(url=current_url, last_status=status, scan_counter=scan_counter)
+                        self._save_session(url=current_url, last_status=status, scan_counter=scan_counter, scan_status=self._scan_status)
                     except Exception as e:
                         log.warning("page.url read failed: %s", e)
                         new_page = self._rebuild_browser(p, reason="url-read-failed")
@@ -562,6 +580,7 @@ class MeituanBot:
         # 排除：整个侧边栏容器（行数 > 6）、tab、按钮、列表底部
         candidates: List[Any] = []
         seen_texts = set()
+        pending_signal_seen = False
         # 这些是 tab / 列表标识，出现说明是容器
         EXCLUDE_TOKENS = ("已经到底了", "暂无消息", "加载中")
         for it in raw_items:
@@ -569,6 +588,7 @@ class MeituanBot:
                 t = (it.inner_text() or "").strip()
             except Exception:
                 continue
+            pending_signal_seen = pending_signal_seen or card_has_pending_signal(t)
             if not t or len(t) > 180:  # 真实卡片 < 120 字符
                 continue
             if t in seen_texts:
@@ -576,16 +596,7 @@ class MeituanBot:
             # 排除包含容器标识的
             if any(tok in t for tok in EXCLUDE_TOKENS):
                 continue
-            lines = [l.strip() for l in t.split("\n") if l.strip()]
-            # 真实会话卡片：3-6 行（姓名/订单数/时间/状态）
-            if not (3 <= len(lines) <= 6):
-                continue
-            # 会话卡片特征判定
-            has_order = "已下" in t  # "已下11单"
-            has_time = bool(re.search(r"\d{1,2}:\d{2}", t))
-            has_status = any(kw in t for kw in ("机器人", "客服", "推荐商品", "接待中"))
-            # 必须有"已下"或"机器人"+"时间"等组合
-            if not (has_order or (has_status and has_time)):
+            if not conversation_card_is_candidate(t):
                 continue
             candidates.append((it, t))
             seen_texts.add(t)
@@ -613,11 +624,14 @@ class MeituanBot:
 
         log.info("[scan] raw=%d candidates=%d unique=%d", len(raw_items), len(candidates), len(deduped))
         if not deduped:
+            self._scan_status = "mismatch" if pending_signal_seen else "ok"
+            self._save_session(url=page.url or "", last_status="workbench", scan_status=self._scan_status)
             # 没有候选时，dump 一次 DOM 辅助定位
             self._dump_dom_diagnostics(page, tag="scan-no-candidates")
             return False
 
         max_n = int(self.monitor.get("max_conversations_per_scan", 8))
+        self._scan_status = "ok"
         try:
             for item, txt, cust in deduped[:max_n]:
                 if self._stop:
@@ -1042,7 +1056,7 @@ class MeituanBot:
     @staticmethod
     def _extract_masked_name_from_text(txt: str) -> str:
         s = (txt or "").replace(" ", " ")
-        order_line = re.search(r"\d{1,3}\.\d{1,2}#\d+单\s+([A-Za-z][*?]{1,4})", s)
+        order_line = re.search(r"(?:\d{1,3}\.\d{1,2}|今日)#\d+单\s+([^\s]{1,8})", s)
         if order_line:
             return order_line.group(1)
         masked = MASKED_NAME_RE.search(s)
