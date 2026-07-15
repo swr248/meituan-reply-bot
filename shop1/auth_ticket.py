@@ -9,6 +9,8 @@ import time
 
 _USED_TICKETS: dict[str, int] = {}
 _USED_TICKETS_LOCK = threading.Lock()
+DEFAULT_TICKET_TTL_SECONDS = 300
+MAX_TICKET_TTL_SECONDS = 300
 
 
 def _encode(data: bytes) -> str:
@@ -19,7 +21,7 @@ def _decode(value: str) -> bytes:
     return base64.urlsafe_b64decode(value + '=' * (-len(value) % 4))
 
 
-def issue_ticket(secret: str, shop: str, target: str, now: int | None = None, ttl: int = 60) -> str:
+def issue_ticket(secret: str, shop: str, target: str, now: int | None = None, ttl: int = DEFAULT_TICKET_TTL_SECONDS) -> str:
     issued = int(time.time() if now is None else now)
     payload = {'shop': shop, 'target': target, 'iat': issued, 'exp': issued + ttl, 'jti': secrets.token_urlsafe(16)}
     body = _encode(json.dumps(payload, separators=(',', ':'), sort_keys=True).encode('utf-8'))
@@ -41,7 +43,7 @@ def verify_ticket(ticket: str, secret: str, shop: str, target: str | None = None
     expires = int(payload.get('exp', 0))
     if payload.get('shop') != shop or expires < current:
         raise ValueError('expired or wrong shop ticket')
-    if issued > current + 5 or expires - issued > 120 or expires <= issued or not payload.get('jti'):
+    if issued > current + 5 or expires - issued > MAX_TICKET_TTL_SECONDS or expires <= issued or not payload.get('jti'):
         raise ValueError('invalid ticket lifetime')
     if payload.get('target') not in ('admin', 'browser'):
         raise ValueError('invalid ticket target')

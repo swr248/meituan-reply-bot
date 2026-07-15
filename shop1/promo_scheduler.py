@@ -142,15 +142,35 @@ class BrowserClient:
           var sw = document.querySelector(".sg-onestop-header-switch");
           if(!sw) return null;
           var input = sw.querySelector("input[type=checkbox]");
-          return {on: !!(input && input.checked), url: location.href};
+          var parent = sw.parentElement;
+          return {
+            checked: !!(input && input.checked),
+            text: parent ? (parent.innerText || "") : "",
+            url: location.href
+          };
         })()'''
         try:
             r = self.eval(js)
-            if r.get("ok") and r.get("result") is not None and r["result"] != "null":
-                return r["result"]
+            snapshot = r.get("result") if r.get("ok") else None
+            if snapshot is None or snapshot == "null":
+                return None
+            state = promotion_state_from_snapshot(snapshot.get("checked"), snapshot.get("text", ""))
+            if state is None:
+                return None
+            return {"on": state, "text": snapshot.get("text", ""), "url": snapshot.get("url", "")}
         except Exception:
             return None
-        return None
+
+
+def promotion_state_from_snapshot(checked: bool, text: str) -> bool | None:
+    normalized = "".join(str(text or "").split())
+    if "推广未开启" in normalized or "推广已关闭" in normalized:
+        return False
+    if "推广进行中" in normalized or "推广已开启" in normalized:
+        return True
+    # The page ships a checked HTML attribute before async state hydration.
+    # Until a visible status label appears, treating it as real would be unsafe.
+    return None
 
 
 def parse_hhmm(s: str) -> int:

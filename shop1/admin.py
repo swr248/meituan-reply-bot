@@ -32,7 +32,7 @@ from pydantic import BaseModel
 from browser_common import load_config, log
 from cookie_sync import cookie_file_exists, cookie_file_age_seconds, cookie_file_path
 from rules import decide_reply
-from auth_ticket import consume_ticket, issue_ticket
+from auth_ticket import DEFAULT_TICKET_TTL_SECONDS, consume_ticket, issue_ticket
 
 ROOT = Path(__file__).resolve().parent
 STATE_DIR = ROOT / "state"
@@ -371,8 +371,26 @@ def api_remote_browser_url(token: str = Query(...)) -> Dict[str, Any]:
     secret = _current_auth_token(server)
     if not base or not secret:
         raise HTTPException(500, "remote_browser_public_url or auth_token not configured")
-    ticket = issue_ticket(secret, _shop_id(), "browser", ttl=60)
+    ticket = issue_ticket(secret, _shop_id(), "browser", ttl=DEFAULT_TICKET_TTL_SECONDS)
     return {"url": f"{base}/auth/exchange?ticket={ticket}", "token_fingerprint": _token_fingerprint(secret), "legacy_tokens": _token_compat_count(server)}
+
+
+@app.get("/api/open-url")
+def api_open_url(target: str = Query(...), token: str = Query(...)) -> Dict[str, Any]:
+    """Issue a fresh one-time URL at click time so rendered pages never hold stale tickets."""
+    _check_token(token)
+    if target not in ("admin", "browser"):
+        raise HTTPException(404, "shop target not found")
+    cfg = load_config(CONFIG_PATH)
+    server = cfg.get("server", {}) or {}
+    secret = _current_auth_token(server)
+    if not secret:
+        raise HTTPException(500, "shop auth token not configured")
+    base = _public_admin_url(server) if target == "admin" else str(server.get("remote_browser_public_url", "") or "").rstrip("/")
+    if not base:
+        raise HTTPException(500, f"{target} public URL not configured")
+    ticket = issue_ticket(secret, _shop_id(), target, ttl=DEFAULT_TICKET_TTL_SECONDS)
+    return {"url": f"{base}/auth/exchange?ticket={ticket}", "expires_in": DEFAULT_TICKET_TTL_SECONDS}
 
 
 @app.get("/api/units")
@@ -498,11 +516,8 @@ def _shop_entry(name: str, root: Path) -> Dict[str, Any]:
     server = cfg.get("server", {}) or {}
     suffix = server.get("instance_suffix", "") or ""
     shop_id = "shop2" if suffix == "-shop2" else "shop1"
-    secret = _current_auth_token(server)
     admin_url = _public_admin_url(server)
     browser_url = (server.get("remote_browser_public_url", "") or "").rstrip("/")
-    admin_ticket = issue_ticket(secret, shop_id, "admin", ttl=60) if secret else ""
-    browser_ticket = issue_ticket(secret, shop_id, "browser", ttl=60) if secret else ""
     capture_unit = f"meituan-capture-meituan-reply-bot{suffix}.service"
     return {
         "name": name,
@@ -510,8 +525,8 @@ def _shop_entry(name: str, root: Path) -> Dict[str, Any]:
         "admin_port": server.get("admin_port"),
         "admin_url": admin_url,
         "remote_browser_url": browser_url,
-        "admin_open_url": f"{admin_url}/auth/exchange?ticket={admin_ticket}" if admin_url and admin_ticket else "",
-        "browser_open_url": f"{browser_url}/auth/exchange?ticket={browser_ticket}" if browser_url and browser_ticket else "",
+        "admin_open_url": "",
+        "browser_open_url": "",
         "token_fingerprint": _token_fingerprint(_current_auth_token(server)),
         "legacy_token_count": _token_compat_count(server),
         "bot_unit": f"meituan-reply-bot{suffix}.service",
@@ -1312,7 +1327,8 @@ function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&l
 function state(unit){return unit&&unit.active?'<span class="ok">运行中</span>':'<span class="bad">已停止</span>';}
 function cookie(c){if(!c)return '<span class="warn">未知</span>'; return c.status==='valid'?`<span class="ok">有效</span> ${esc(c.age_display||'')}`:`<span class="warn">${esc(c.status_text||'异常')}</span>`;}
 async function api(path){const u=new URL(path,location.origin);u.searchParams.set('token',TOKEN);const r=await fetch(u);if(!r.ok)throw new Error(await r.text());return r.json();}
-async function load(){const r=await api('/api/shops');const box=document.getElementById('shops');box.innerHTML=(r.shops||[]).map(s=>{const admin=s.admin_open_url||'#';const browser=s.browser_open_url||'#';return `<div class="card"><b>${esc(s.name)}</b><div style="margin-top:10px">机器人：${state(s.bot)}<br>登录浏览器：${state(s.browser)}<br>Cookie：${cookie(s.cookie)}</div><a class="btn" href="${admin}">进入店铺管理</a><a class="btn secondary" href="${browser}" target="_blank" rel="noopener">打开登录浏览器</a><div class="muted small">管理外网：${esc(s.admin_url||'-')}<br>浏览器外网：${esc(s.remote_browser_url||'-')}<br>Token：${esc(s.token_fingerprint||'-')}</div></div>`}).join('')||'<div class="muted">暂无店铺</div>';}
+async function openFreshUrl(event,target){event.preventDefault();let popup=null;if(target==='browser')popup=window.open('about:blank','_blank');try{if(target==='admin'){location.assign('/shop?token='+encodeURIComponent(TOKEN));return;}const r=await api('/api/open-url?target='+encodeURIComponent(target));if(popup)popup.location.assign(r.url);else location.assign(r.url);}catch(e){if(popup)popup.close();alert('打开失败：'+(e.message||e));}}
+async function load(){const r=await api('/api/shops');const box=document.getElementById('shops');box.innerHTML=(r.shops||[]).map(s=>`<div class="card"><b>${esc(s.name)}</b><div style="margin-top:10px">机器人：${state(s.bot)}<br>登录浏览器：${state(s.browser)}<br>Cookie：${cookie(s.cookie)}</div><a class="btn" href="#" onclick="openFreshUrl(event,'admin')">进入店铺管理</a><a class="btn secondary" href="#" target="_blank" rel="noopener" onclick="openFreshUrl(event,'browser')">打开登录浏览器</a><div class="muted small">管理外网：${esc(s.admin_url||'-')}<br>浏览器外网：${esc(s.remote_browser_url||'-')}<br>Token：${esc(s.token_fingerprint||'-')}</div></div>`).join('')||'<div class="muted">暂无店铺</div>';}
 load().catch(e=>{document.getElementById('shops').innerHTML='<span class="bad">加载失败：'+esc(e.message)+'</span>';});
 </script></div></body></html>"""
 
@@ -1609,6 +1625,19 @@ async function api(path, opts){
   if (!r.ok) { alert('HTTP '+r.status+': '+await r.text()); throw new Error('http'); }
   return r.json();
 }
+async function openFreshUrl(event,target){
+  event.preventDefault();
+  let popup = null;
+  if (target === 'browser') popup = window.open('about:blank', '_blank');
+  try {
+    if (target === 'admin') { location.assign('/shop?token=' + encodeURIComponent(TOKEN)); return; }
+    const r = await api('/api/open-url?target=' + encodeURIComponent(target));
+    if (popup) popup.location.assign(r.url); else location.assign(r.url);
+  } catch(e) {
+    if (popup) popup.close();
+    alert('打开失败：' + (e.message || e));
+  }
+}
 function el(tag, cls, text){ const e=document.createElement(tag); if(cls)e.className=cls; if(text)e.textContent=text; return e; }
 function esc(s){
   return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -1696,20 +1725,17 @@ async function loadAccessLinks(){
   if (!box) return;
   try {
     const inst = await api('/api/instance');
-    const browser = await api('/api/remote-browser-url');
     const shopsResp = await api('/api/shops');
     const currentAdmin = `${(inst.admin_url || location.origin).replace(/\/$/,'')}/shop?token=${encodeURIComponent(TOKEN)}`;
     const current = `<div class="stat" style="min-width:300px"><b>当前店铺</b>
       <div>管理页：<a href="${currentAdmin}" target="_blank" style="color:#93c5fd">打开</a></div>
-      <div>登录浏览器：<a href="${browser.url}" target="_blank" style="color:#93c5fd">打开</a></div>
+      <div>登录浏览器：<a href="#" onclick="openFreshUrl(event,'browser')" style="color:#93c5fd">打开</a></div>
       <div class="muted">${esc(inst.name)} / token=${esc(inst.token_fingerprint || '-')}</div>
     </div>`;
     const shops = (shopsResp.shops || []).map(s => {
-      const adminUrl = s.admin_open_url || '#';
-      const browserUrl = s.browser_open_url || '#';
       return `<div class="stat" style="min-width:300px"><b>${esc(s.name)}</b>
-        <div>管理页：<a href="${adminUrl}" target="_blank" style="color:#93c5fd">${esc(adminUrl)}</a></div>
-        <div>登录浏览器：<a href="${browserUrl}" target="_blank" style="color:#93c5fd">${esc(browserUrl)}</a></div>
+        <div>管理页：<a href="#" onclick="openFreshUrl(event,'admin')" style="color:#93c5fd">点击时生成安全链接</a></div>
+        <div>登录浏览器：<a href="#" onclick="openFreshUrl(event,'browser')" style="color:#93c5fd">点击时生成安全链接</a></div>
       </div>`;
     }).join('');
     box.innerHTML = current + shops;
@@ -1751,16 +1777,14 @@ async function loadShops(){
     const r = await api('/api/shops');
     const shops = r.shops || [];
     grid.innerHTML = shops.map(s => {
-      const adminUrl = s.admin_open_url || '#';
-      const browserUrl = s.browser_open_url || '#';
       return `<div class="stat" style="min-width:280px">
         <b>${s.name}</b>
         <div>机器人：${unitState(s.bot)}　浏览器：${unitState(s.browser)}</div>
         <div>Cookie：${shopCookie(s.cookie)}</div>
         <div class="muted">管理端口：${s.admin_port || '-'}　Token指纹：${s.token_fingerprint || '-'}</div>
         <div style="margin-top:8px">
-          <a href="${adminUrl}" target="_blank" style="color:#93c5fd">打开管理页</a>
-          ${s.remote_browser_url ? `　<a href="${browserUrl}" target="_blank" style="color:#93c5fd">登录浏览器</a>` : ''}
+          <a href="#" onclick="openFreshUrl(event,'admin')" style="color:#93c5fd">打开管理页</a>
+          ${s.remote_browser_url ? `　<a href="#" onclick="openFreshUrl(event,'browser')" style="color:#93c5fd">登录浏览器</a>` : ''}
         </div>
       </div>`;
     }).join('') || '<span class="muted">暂无店铺</span>';

@@ -15,7 +15,7 @@ import yaml
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, RedirectResponse
 
-from auth_ticket import issue_ticket
+from auth_ticket import DEFAULT_TICKET_TTL_SECONDS, issue_ticket
 
 MASTER_TOKEN = os.environ.get("MASTER_ADMIN_TOKEN", "")
 PUBLIC_HOST = os.environ.get("MEITUAN_PUBLIC_HOST", "")
@@ -267,7 +267,7 @@ def api_open_shop(shop_id: str, target: str, token: str = Query(...)) -> Redirec
     secret = str((cfg.get("server", {}) or {}).get("auth_token", "") or "")
     if not secret:
         raise HTTPException(500, "shop auth token not configured")
-    ticket = issue_ticket(secret, shop_id, target, ttl=60)
+    ticket = issue_ticket(secret, shop_id, target, ttl=DEFAULT_TICKET_TTL_SECONDS)
     port = shop["admin_external_port"] if target == "admin" else shop["browser_external_port"]
     return RedirectResponse(f"http://{PUBLIC_HOST}:{port}/auth/exchange?ticket={ticket}", status_code=302)
 

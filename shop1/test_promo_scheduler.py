@@ -2,7 +2,7 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from promo_scheduler import CaptureLease, capture_available_for_scheduler, in_any_window, reconcile_interval_sec, safe_url_for_log, should_reconcile
+from promo_scheduler import CaptureLease, capture_available_for_scheduler, in_any_window, promotion_state_from_snapshot, reconcile_interval_sec, safe_url_for_log, should_reconcile
 
 
 def test_regular_window_opens_at_start_and_closes_at_end():
@@ -38,6 +38,15 @@ def test_safe_url_for_log_removes_credentials_and_keeps_route():
     assert 'secret' not in sanitized
     assert '123' not in sanitized
     assert 'hidden' not in sanitized
+
+def test_visible_status_text_overrides_stale_checkbox_state():
+    assert promotion_state_from_snapshot(True, "推广未开启") is False
+    assert promotion_state_from_snapshot(False, "推广进行中") is True
+
+
+def test_unknown_status_text_does_not_trust_initial_checked_attribute():
+    assert promotion_state_from_snapshot(True, "加载中") is None
+
 
 
 def test_scheduler_does_not_take_over_external_capture():
